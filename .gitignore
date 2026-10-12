@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+data/settings.json
+data/settings.json.bak
+data/settings.tmp
+data/*.db
+data/*.db-*
+data/logs/
+.idea/
+_style_ref/
+*.log
