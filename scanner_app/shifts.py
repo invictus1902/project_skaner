@@ -63,10 +63,12 @@ def duration_minutes(start_date: str, start_time: str, end_date: str, end_time: 
         return None
     start = datetime.strptime(start_day + "T" + start_clock, "%Y-%m-%dT%H:%M:%S")
     end = datetime.strptime(end_day + "T" + end_clock, "%Y-%m-%dT%H:%M:%S")
+    # Ночная смена: уход раньше прихода только в ту же календарную дату.
+    # Более ранняя дата — это ошибка ввода, а не переход через полночь.
     if end < start:
+        if start_day != end_day:
+            return None
         end = end + timedelta(days=1)
-    if end < start:
-        return None
     return max(0, int(round((end - start).total_seconds() / 60)))
 
 
@@ -83,7 +85,10 @@ def format_duration(minutes) -> str:
 
 
 def is_open(session: dict) -> bool:
-    return not str(session.get("endTime") or "").strip()
+    """Идущая смена: уход ещё не проставлен. Старые ответы без endTime смотрят на status."""
+    if "endTime" in session:
+        return not str(session.get("endTime") or "").strip()
+    return session.get("status") == "active"
 
 
 def person_state(sessions: list) -> str:

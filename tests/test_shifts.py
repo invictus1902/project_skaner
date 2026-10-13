@@ -27,6 +27,9 @@ class ShiftLogicTests(unittest.TestCase):
         self.assertEqual(duration_minutes("2026-10-12", "22:00", "2026-10-13", "06:00"), 480)
         self.assertEqual(duration_minutes("12.10.2026", "22:00", "12.10.2026", "06:00"), 480)
         self.assertIsNone(duration_minutes("12.10.2026", "10:00", "10.10.2026", "09:00"))
+        self.assertIsNone(duration_minutes("2026-10-12", "08:00", "2026-10-11", "10:00"))
+        self.assertEqual(person_state([{"status": "active", "startTime": "09:00:00"}]), STATE_AT_WORK)
+        self.assertEqual(person_state([{"status": "completed", "startTime": "09:00:00"}]), STATE_AWAY)
 
 
 class ShiftQueueTests(unittest.TestCase):

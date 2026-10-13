@@ -155,6 +155,50 @@ class Database:
             )
             self._conn.commit()
 
+    def suppress_repeated_pending(self, badge: str) -> int:
+        """Убрать из очереди повторы той же отметки подряд.
+
+        Остаётся последняя отметка серии: у сайта каждая отправка переключает
+        смену, а более ранний дубль не должен затирать новый приход.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, event_type FROM events
+                WHERE badge = ? AND status = 'pending'
+                ORDER BY id ASC
+                """,
+                (badge,),
+            ).fetchall()
+            previous = None
+            remove_ids = []
+            for row in reversed(rows):
+                if previous == row["event_type"]:
+                    remove_ids.append(int(row["id"]))
+                else:
+                    previous = row["event_type"]
+            reason = "Повтор той же отметки, пока прошлая ещё не отправлена."
+            for event_id in remove_ids:
+                self._conn.execute(
+                    "UPDATE events SET status='rejected', error=? WHERE id=?",
+                    (reason, event_id),
+                )
+            if remove_ids:
+                self._conn.commit()
+        return len(remove_ids)
+
+    def has_older_pending(self, badge: str, event_id: int) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1 AS hit FROM events
+                WHERE badge = ? AND status = 'pending' AND id < ?
+                LIMIT 1
+                """,
+                (badge, int(event_id)),
+            ).fetchone()
+        return row is not None
+
     def last_counted_event(self, badge: str) -> dict | None:
         with self._lock:
             row = self._conn.execute(

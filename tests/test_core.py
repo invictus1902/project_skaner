@@ -17,7 +17,7 @@ from scanner_app.config import (
     verify_password,
 )
 from scanner_app.db import Database
-from scanner_app.logic import decide_event, normalize_badge, plural, render_speech, speak_time
+from scanner_app.logic import decide_event, manual_badge, normalize_badge, plural, render_speech, speak_time
 from scanner_app.scanner import ScanAssembler
 from scanner_app.service import AttendanceService
 
@@ -41,6 +41,16 @@ class LogicTests(unittest.TestCase):
         scanner["badge_regex"] = r"badge=([A-Za-z0-9]+)"
         self.assertEqual(normalize_badge("https://corp.local/pass?badge=AB12", scanner), "AB12")
         self.assertEqual(normalize_badge("нет-кода", scanner), "")
+
+    def test_manual_badge_keeps_symbols_and_short_codes(self) -> None:
+        scanner = dict(default_settings()["scanner"])
+        scanner["badge_regex"] = r"badge=([A-Za-z0-9]+)"
+        scanner["min_length"] = 3
+        self.assertEqual(manual_badge("12", scanner), "12")
+        self.assertEqual(manual_badge("A-12/б", scanner), "A-12/б")
+        self.assertEqual(manual_badge("]Q312345", scanner), "12345")
+        self.assertEqual(manual_badge("   ", scanner), "")
+        self.assertEqual(manual_badge("https://corp.local/pass?badge=AB12", scanner), "AB12")
 
     def test_shift_decision(self) -> None:
         now = datetime(2026, 10, 12, 18, 0, tzinfo=timezone.utc)
@@ -175,6 +185,67 @@ class ApiTests(unittest.TestCase):
         self.assertIn("с бейджем 1", client.probe())
         self.assertNotIn("secret", client.probe())
 
+    def test_closed_checkin_writes_the_shift_like_manual_edit(self) -> None:
+        wall = '{"message":"Protected by Vercel Authentication","protection":{"vercel_auth_enabled":true}}'
+        store = {"rows": []}
+        seen = []
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            seen.append((request.method, url, request.data, request.get_header("Apikey")))
+            if url.startswith("https://example.test"):
+                return 401, wall.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/users" in url:
+                body = '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001", "password": "secret"}]'
+                return 200, body.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/workSessions" in url:
+                return 200, json.dumps(store["rows"]).encode("utf-8")
+            if request.method == "POST" and "/rest/v1/workSessions" in url:
+                body = json.loads(request.data.decode("utf-8"))
+                row = {"id": 118, "userId": body["userId"], "date": body["date"], "startTime": body["startTime"], "endTime": None, "status": "active"}
+                store["rows"] = [row]
+                return 201, json.dumps([row]).encode("utf-8")
+            if request.method == "PATCH" and "id=eq.118" in url:
+                body = json.loads(request.data.decode("utf-8"))
+                store["rows"][0].update(body)
+                return 200, json.dumps([store["rows"][0]]).encode("utf-8")
+            return 500, b""
+
+        settings = default_settings()
+        settings["server"]["base_url"] = "https://example.test"
+        settings["server"]["read_url"] = "https://example.test"
+        settings["server"]["write_url"] = "https://example.test"
+        settings["server"]["supabase_url"] = "https://db.test"
+        settings["server"]["supabase_key"] = "anon-key"
+        settings["server"]["login"] = ""
+        settings["server"]["password"] = ""
+        client = ApiClient(settings, transport=transport)
+        started = client.post_event(
+            {"badge": "adm001", "event": "in", "timestamp": "2026-10-14T09:15:04+06:00", "name": "Эмир"}
+        )
+        self.assertTrue(started.ok)
+        self.assertEqual(extract_event(started.data), "in")
+        self.assertEqual(store["rows"][0]["startTime"], "09:15:04")
+        self.assertEqual(store["rows"][0]["status"], "active")
+        finished = client.post_event(
+            {"badge": "adm001", "event": "out", "timestamp": "2026-10-14T18:05:00+06:00", "name": "Эмир"}
+        )
+        self.assertTrue(finished.ok)
+        self.assertEqual(extract_event(finished.data), "out")
+        self.assertEqual(store["rows"][0]["status"], "completed")
+        self.assertEqual(store["rows"][0]["endTime"], "18:05:00")
+        self.assertEqual(store["rows"][0]["durationMinutes"], 530)
+        posts = [item for item in seen if item[0] in ("POST", "PATCH") and "db.test" in item[1]]
+        self.assertEqual(len(posts), 2)
+        for item in posts:
+            self.assertEqual(item[3], "anon-key")
+            self.assertNotIn("anon-key", item[1])
+            self.assertNotIn(b"secret", item[2])
+            self.assertNotIn(b"password", item[2])
+        self.assertTrue(any(item[0] == "POST" and json.loads(item[2].decode("utf-8"))["source"] == "qr" for item in posts))
+        self.assertFalse(any(item[1].endswith("/api/qr-checkin") for item in seen))
+
     def test_vercel_login_page_is_not_a_directory(self) -> None:
         def transport(request, timeout, context):
             del request, timeout, context
@@ -266,6 +337,15 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("password", posted)
         self.assertEqual(posts[0][5], "return=representation")
         self.assertFalse(any("anon-key" in item[1] for item in seen))
+        hosted_sessions = [
+            item[1]
+            for item in seen
+            if item[0] == "GET" and item[1].startswith("https://db.test/rest/v1/workSessions")
+        ]
+        self.assertTrue(hosted_sessions)
+        self.assertTrue(all("order=id.desc" in url for url in hosted_sessions))
+        self.assertEqual(client.canonical_badge("55001"), "55001")
+        self.assertEqual(client.canonical_badge("  55001  "), "55001")
 
     def test_admin_sign_in_authorizes_checkin_without_leaking_password(self) -> None:
         seen = []
@@ -382,6 +462,23 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(any("ignored" in url for _method, url, _body in seen))
         self.assertFalse(any(url.endswith("/login") for _method, url, _body in seen))
 
+    def test_canonical_badge_follows_directory_spelling(self) -> None:
+        def transport(request, timeout, context):
+            del timeout, context
+            if request.full_url.startswith("http://read/users"):
+                body = '[{"id": 2, "fullName": "Эмир", "badgeId": "Adm001"}]'
+                return 200, body.encode("utf-8")
+            return 500, b""
+
+        settings = default_settings()
+        settings["server"]["read_url"] = "http://read"
+        settings["server"]["write_url"] = "http://write"
+        settings["server"]["base_url"] = "http://read"
+        client = ApiClient(settings, transport=transport)
+        self.assertEqual(client.canonical_badge("adm001"), "Adm001")
+        self.assertEqual(client.canonical_badge("  ADM001 "), "Adm001")
+        self.assertEqual(client.canonical_badge("нет-такого"), "нет-такого")
+
     def test_old_single_address_fills_both_links(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "settings.json"
@@ -428,6 +525,11 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(db.last_counted_event("10")["status"], "sent")
             db.upsert_employee("10", "Иван Иванов", "manual")
             self.assertEqual(db.get_employee("10")["name"], "Иван Иванов")
+            for kind in ("in", "in", "out", "in", "in"):
+                db.insert_event("77", "Иван", kind, moment, {"badge": "77", "event": kind})
+            self.assertEqual(db.suppress_repeated_pending("77"), 2)
+            self.assertEqual([row["event_type"] for row in db.pending_events() if row["badge"] == "77"], ["in", "out", "in"])
+            self.assertFalse(db.has_older_pending("77", db.pending_events()[0]["id"]))
             db.close()
 
 
@@ -498,6 +600,20 @@ class ServiceTests(unittest.TestCase):
         service = AttendanceService(settings, db, api, speaker, ui)
         return service, db, ui, speaker, api
 
+    def test_manual_symbolic_code_is_stored(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, ui, _speaker, _api = self._service(folder)
+            try:
+                service.settings["scanner"]["badge_regex"] = r"badge=([A-Za-z0-9]+)"
+                service.settings["scanner"]["min_length"] = 4
+                service._process("№15-А", manual=True)
+                self.assertEqual(db.recent_events(1)[0]["badge"], "№15-А")
+                self.assertEqual(ui.views[-1]["state"], "offline")
+                service._process("№15-А", manual=False)
+                self.assertEqual(ui.views[-1]["title"], "КОД НЕ РАСПОЗНАН")
+            finally:
+                db.close()
+
     def test_local_in_then_out_when_server_is_down(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             service, db, ui, speaker, api = self._service(folder)
@@ -539,6 +655,134 @@ class ServiceTests(unittest.TestCase):
                 service._process("404")
                 self.assertEqual(api.posts, [])
                 self.assertEqual(ui.views[-1]["state"], "unknown")
+                self.assertEqual(db.count_pending(), 0)
+            finally:
+                db.close()
+
+    def test_manual_arrival_then_scan_closes_shift_while_server_is_unaware(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, ui, speaker, api = self._service(folder, "http://server")
+            try:
+                api.employee = HttpResult(True, 200, {"name": "Эмир Абдуразаков", "active": True}, None, False)
+                api.status = HttpResult(True, 200, {"last_event": "out", "name": "Эмир Абдуразаков"}, None, False)
+                api.post = HttpResult(False, 401, {"message": "Для отметки нужен ключ доступа"}, None, False)
+                service._process("adm001", manual=True)
+                service._process("adm001", manual=False)
+                pending = [row["event_type"] for row in db.pending_events()]
+                self.assertEqual(pending, ["in", "out"])
+                self.assertEqual(ui.views[-1]["title"], "УХОД")
+                self.assertEqual(ui.views[-1]["state"], "offline")
+                self.assertIn("Уход", speaker.said[-1])
+                self.assertEqual(len(api.posts), 1)
+                self.assertEqual(api.posts[0]["event"], "in")
+            finally:
+                db.close()
+
+    def test_manual_then_scan_reaches_the_site_database(self) -> None:
+        wall = '{"message":"Protected by Vercel Authentication","protection":{"vercel_auth_enabled":true}}'
+        store = {"rows": []}
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            if url.startswith("https://example.test"):
+                return 401, wall.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/users" in url:
+                body = '[{"id": 2, "fullName": "Эмир Абдуразаков", "badgeId": "adm001", "role": "admin"}]'
+                return 200, body.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/workSessions" in url:
+                return 200, json.dumps(store["rows"]).encode("utf-8")
+            if request.method == "POST" and "/rest/v1/workSessions" in url:
+                body = json.loads(request.data.decode("utf-8"))
+                store["rows"] = [
+                    {
+                        "id": 118,
+                        "userId": body["userId"],
+                        "date": body["date"],
+                        "startTime": body["startTime"],
+                        "endTime": None,
+                        "status": "active",
+                        "source": body["source"],
+                    }
+                ]
+                return 201, json.dumps(store["rows"]).encode("utf-8")
+            if request.method == "PATCH" and "id=eq.118" in url:
+                body = json.loads(request.data.decode("utf-8"))
+                store["rows"][0].update(body)
+                return 200, json.dumps([store["rows"][0]]).encode("utf-8")
+            return 500, b""
+
+        with tempfile.TemporaryDirectory() as folder:
+            settings = default_settings()
+            settings["server"]["base_url"] = "https://example.test"
+            settings["server"]["read_url"] = "https://example.test"
+            settings["server"]["write_url"] = "https://example.test"
+            settings["server"]["supabase_url"] = "https://db.test"
+            settings["server"]["supabase_key"] = "anon-key"
+            settings["server"]["login"] = ""
+            settings["server"]["password"] = ""
+            settings["scanner"]["cooldown_sec"] = 0
+            settings["voice"]["enabled"] = False
+            settings["voice"]["beep"] = False
+            db = Database(Path(folder) / "t.db")
+            ui = FakeUi()
+            api = ApiClient(settings, transport=transport)
+            service = AttendanceService(settings, db, api, FakeSpeaker(), ui)
+            try:
+                service._process("adm001", manual=True)
+                service._process("adm001", manual=False)
+                self.assertEqual(ui.views[-1]["title"], "УХОД")
+                self.assertEqual(ui.views[-1]["state"], "out")
+                self.assertEqual(db.count_pending(), 0)
+                self.assertEqual(store["rows"][0]["status"], "completed")
+                self.assertEqual(store["rows"][0]["source"], "qr")
+                self.assertTrue(store["rows"][0]["endTime"])
+            finally:
+                db.close()
+
+    def test_repeated_pending_arrivals_collapse_before_departure(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, ui, _speaker, api = self._service(folder, "http://server")
+            try:
+                api.status = HttpResult(True, 200, {"last_event": "out", "name": "Иван"}, None, False)
+                api.post = HttpResult(False, 401, {"message": "ключ"}, None, False)
+                moment = datetime.now().astimezone()
+                for _ in range(3):
+                    db.insert_event("emp001", "Иван", "in", moment, {"badge": "emp001", "event": "in"})
+                service._process("emp001")
+                self.assertEqual([row["event_type"] for row in db.pending_events()], ["in", "out"])
+                self.assertEqual(ui.views[-1]["title"], "УХОД")
+                self.assertEqual(api.posts, [])
+            finally:
+                db.close()
+
+    def test_old_unsent_arrival_can_start_a_new_shift_and_then_close(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, ui, _speaker, api = self._service(folder, "http://server")
+            try:
+                api.status = HttpResult(True, 200, {"last_event": "out"}, None, False)
+                api.post = HttpResult(False, 401, {"message": "ключ"}, None, False)
+                old = datetime.now().astimezone() - timedelta(hours=20)
+                db.insert_event("10001", "Иван", "in", old, {"badge": "10001", "event": "in"})
+                service._process("10001")
+                self.assertEqual(db.pending_events()[-1]["event_type"], "in")
+                service._process("10001")
+                self.assertEqual([row["event_type"] for row in db.pending_events()], ["in", "out"])
+                self.assertEqual(ui.views[-1]["title"], "УХОД")
+            finally:
+                db.close()
+
+    def test_closed_server_shift_starts_again_after_a_sent_arrival(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, _ui, _speaker, api = self._service(folder, "http://server")
+            try:
+                moment = datetime.now().astimezone()
+                event_id = db.insert_event("10001", "Иван", "in", moment, {"badge": "10001", "event": "in"})
+                db.mark_sent(event_id, "Иван", "in")
+                api.status = HttpResult(True, 200, {"last_event": "out", "name": "Иван"}, None, False)
+                api.post = HttpResult(True, 200, {"ok": True, "event": "in", "name": "Иван"}, None, False)
+                service._process("10001")
+                self.assertEqual(api.posts[0]["event"], "in")
                 self.assertEqual(db.count_pending(), 0)
             finally:
                 db.close()

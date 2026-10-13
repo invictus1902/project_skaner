@@ -98,6 +98,7 @@ class ScannerController:
         self.settings = settings
         self.on_burst = on_burst
         self.hook_ok = False
+        self.paused = False
         self._stop = threading.Event()
         self._listener = None
         self._tick_thread: threading.Thread | None = None
@@ -184,6 +185,8 @@ class ScannerController:
             return
 
         def on_press(key):
+            if self.paused:
+                return
             try:
                 char = getattr(key, "char", None)
                 if char in ("\r", "\n"):

@@ -19,7 +19,7 @@ from scanner_app.shifts import (
     person_state,
     sessions_for_user,
 )
-from scanner_app.theme import theme_by_name
+from scanner_app.theme import apply_ttk_style, theme_by_name
 
 
 class ShiftsWindow(tk.Toplevel):
@@ -31,8 +31,10 @@ class ShiftsWindow(tk.Toplevel):
         self.title("Смены")
         self.minsize(920, 560)
         width = min(1180, master.winfo_screenwidth() - 80)
-        height = min(760, master.winfo_screenheight() - 80)
-        self.geometry(f"{width}x{height}+{master.winfo_rootx() + 40}+{master.winfo_rooty() + 40}")
+        height = min(760, master.winfo_screenheight() - 100)
+        x = max(0, min(master.winfo_rootx() + 36, master.winfo_screenwidth() - width))
+        y = max(0, min(master.winfo_rooty() + 36, max(0, master.winfo_screenheight() - height - 48)))
+        self.geometry(f"{width}x{height}+{x}+{y}")
         self._theme = theme_by_name((app.settings.get("ui") or {}).get("theme") or "dark")
         _serif, _bold, self.sans = faces(self)
         self._users: list[dict] = []
@@ -40,7 +42,10 @@ class ShiftsWindow(tk.Toplevel):
         self._selected_user = None
         self._filter = tk.StringVar(value="all")
         self._query = tk.StringVar(value="")
+        self._counts = {STATE_AT_WORK: 0, STATE_AWAY: 0, STATE_NEVER: 0}
+        self._filter_buttons: dict = {}
         self._status = tk.StringVar(value="Загружаю сотрудников и смены…")
+        self._person_title = tk.StringVar(value="Выберите сотрудника")
         self._style()
         self._build()
         self._query.trace_add("write", lambda *_args: self._fill_people())
@@ -51,47 +56,40 @@ class ShiftsWindow(tk.Toplevel):
     def _style(self) -> None:
         theme = self._theme
         self.configure(bg=theme["bg"])
-        style = ttk.Style(self)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        sans = self.sans
-        bg = theme["bg"]
-        fg = theme["text"]
-        style.configure(".", background=bg, foreground=fg, font=(sans, 11))
-        style.configure("TFrame", background=bg)
-        style.configure("TLabel", background=bg, foreground=fg, font=(sans, 11))
-        style.configure("Treeview", background=theme["entry"], fieldbackground=theme["entry"], foreground=fg, font=(sans, 11), rowheight=28)
-        style.map("Treeview", background=[("selected", theme["button"])], foreground=[("selected", theme["button_text"])])
-        style.configure("Treeview.Heading", background=theme["header"], foreground=fg, font=(sans, 11, "bold"))
-        style.configure("TButton", padding=(12, 6), background=theme["button"], foreground=theme["button_text"], font=(sans, 11), borderwidth=0)
-        style.map("TButton", background=[("active", theme["button_hover"])])
-        style.configure("TEntry", fieldbackground=theme["entry"], foreground=fg, font=(sans, 11))
+        apply_ttk_style(ttk.Style(self), theme, self.sans)
 
     def _build(self) -> None:
-        theme = self._theme
         top = ttk.Frame(self)
-        top.pack(fill="x", padx=12, pady=(10, 4))
-        ttk.Label(top, textvariable=self._status, wraplength=900, justify="left").pack(anchor="w")
-        buttons = ttk.Frame(self)
-        buttons.pack(fill="x", padx=12, pady=4)
-        ttk.Button(buttons, text="Обновить с сервера", command=self._reload).pack(side="left")
-        ttk.Button(buttons, text="Отправить очередь", command=self._flush).pack(side="left", padx=8)
-        for value, label in (
-            ("all", "Все"),
-            (STATE_AT_WORK, "На работе"),
-            (STATE_AWAY, "Не на работе"),
-            (STATE_NEVER, "Ещё не сканировался"),
-        ):
-            ttk.Radiobutton(buttons, text=label, value=value, variable=self._filter).pack(side="left", padx=(8, 0))
+        top.pack(fill="x", padx=20, pady=(16, 4))
+        ttk.Label(top, text="Смены", font=(self.sans, 22)).pack(anchor="w")
+        ttk.Label(top, textvariable=self._status, wraplength=980, justify="left").pack(anchor="w", pady=(4, 0))
+
         search = ttk.Frame(self)
-        search.pack(fill="x", padx=12, pady=4)
-        ttk.Label(search, text="Поиск").pack(side="left")
-        ttk.Entry(search, textvariable=self._query, width=40).pack(side="left", padx=8)
+        search.pack(fill="x", padx=20, pady=(10, 4))
+        ttk.Label(search, text="Найти").pack(side="left")
+        ttk.Entry(search, textvariable=self._query).pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(search, text="Обновить", command=self._reload).pack(side="left")
+        ttk.Button(search, text="Отправить очередь", command=self._flush).pack(side="left", padx=(8, 0))
+
+        filters = tk.Frame(self, bg=self._theme["bg"])
+        filters.pack(fill="x", padx=20, pady=(4, 10))
+        for value, _label in _FILTERS:
+            button = tk.Button(
+                filters,
+                font=(self.sans, 11),
+                relief="flat",
+                bd=0,
+                padx=14,
+                pady=6,
+                cursor="hand2",
+                command=lambda chosen=value: self._filter.set(chosen),
+            )
+            button.pack(side="left", padx=(0, 8))
+            self._filter_buttons[value] = button
+        self._paint_filters()
 
         pane = ttk.Panedwindow(self, orient="horizontal")
-        pane.pack(fill="both", expand=True, padx=12, pady=8)
+        pane.pack(fill="both", expand=True, padx=20, pady=(0, 16))
         left = ttk.Frame(pane)
         right = ttk.Frame(pane)
         pane.add(left, weight=3)
@@ -105,9 +103,17 @@ class ShiftsWindow(tk.Toplevel):
         self.people.column("badge", width=110, anchor="w")
         self.people.column("state", width=170, anchor="w")
         self.people.pack(fill="both", expand=True)
+        self.people.tag_configure("at_work", foreground=self._theme["in_text"])
+        self.people.tag_configure("away", foreground=self._theme["text"])
+        self.people.tag_configure("never", foreground=self._theme["muted"])
         self.people.bind("<<TreeviewSelect>>", lambda _event: self._fill_sessions())
 
-        ttk.Label(right, text="Смены выбранного сотрудника").pack(anchor="w")
+        ttk.Label(right, textvariable=self._person_title, font=(self.sans, 16)).pack(anchor="w", pady=(0, 8))
+        actions = ttk.Frame(right)
+        actions.pack(fill="x", pady=(0, 8))
+        ttk.Button(actions, text="Начать смену", command=self._start, style="Accent.TButton").pack(side="left")
+        ttk.Button(actions, text="Завершить смену", command=self._finish).pack(side="left", padx=8)
+        ttk.Button(actions, text="Изменить смену", command=self._edit).pack(side="left")
         self.sessions = ttk.Treeview(right, columns=("date", "start", "end", "length", "state"), show="headings", height=12)
         for column, title, width in (
             ("date", "Дата", 110),
@@ -119,17 +125,14 @@ class ShiftsWindow(tk.Toplevel):
             self.sessions.heading(column, text=title)
             self.sessions.column(column, width=width, anchor="w")
         self.sessions.pack(fill="both", expand=True, pady=4)
+        self.sessions.tag_configure("open", foreground=self._theme["in_text"])
+        self.sessions.tag_configure("closed", foreground=self._theme["text"])
+        self.sessions.tag_configure("pending", foreground=self._theme["warn_text"])
         self.sessions.bind("<Double-1>", lambda _event: self._edit())
-
-        actions = ttk.Frame(right)
-        actions.pack(fill="x", pady=(4, 0))
-        ttk.Button(actions, text="Начать смену", command=self._start).pack(side="left")
-        ttk.Button(actions, text="Завершить смену", command=self._finish).pack(side="left", padx=8)
-        ttk.Button(actions, text="Изменить смену", command=self._edit).pack(side="left")
         ttk.Label(
             right,
-            text="У идущей смены меняется только приход. У завершённой — приход и уход. Время можно задать своё.",
-            wraplength=520,
+            text="Двойной щелчок меняет смену. У идущей — только приход, у завершённой — приход и уход.",
+            wraplength=560,
             justify="left",
         ).pack(anchor="w", pady=(8, 0))
 
@@ -162,6 +165,8 @@ class ShiftsWindow(tk.Toplevel):
         counts = {STATE_AT_WORK: 0, STATE_AWAY: 0, STATE_NEVER: 0}
         for user in self._users:
             counts[person_state(sessions_for_user(self._sessions, user.get("id")))] += 1
+        self._counts = counts
+        self._paint_filters()
         text = (
             f"На работе {counts[STATE_AT_WORK]}, не на работе {counts[STATE_AWAY]}, "
             f"ещё не сканировался {counts[STATE_NEVER]}. В очереди {snapshot.get('pending') or 0}."
@@ -195,7 +200,7 @@ class ShiftsWindow(tk.Toplevel):
         chosen = None
         for user, state, name, badge in rows:
             iid = str(user.get("id"))
-            self.people.insert("", "end", iid=iid, values=(name, badge, STATE_LABELS.get(state, state)))
+            self.people.insert("", "end", iid=iid, values=(name, badge or "—", STATE_LABELS.get(state, state)), tags=(state,))
             if iid == selected:
                 chosen = iid
         if chosen:
@@ -204,6 +209,7 @@ class ShiftsWindow(tk.Toplevel):
         elif rows:
             first = str(rows[0][0].get("id"))
             self.people.selection_set(first)
+        self._paint_filters()
         self._fill_sessions()
 
     def _fill_sessions(self) -> None:
@@ -212,7 +218,9 @@ class ShiftsWindow(tk.Toplevel):
         if children:
             self.sessions.delete(*children)
         if not user:
+            self._person_title.set("Выберите сотрудника")
             return
+        self._person_title.set(person_name(user))
         for session in sessions_for_user(self._sessions, user.get("id")):
             iid = _session_iid(session)
             if is_open(session):
@@ -221,12 +229,15 @@ class ShiftsWindow(tk.Toplevel):
             else:
                 state = "Завершена"
                 length = format_duration(session.get("durationMinutes")) or "—"
+            tag = "open" if is_open(session) else "closed"
             if session.get("pending"):
                 state += ", ждёт отправки"
+                tag = "pending"
             self.sessions.insert(
                 "",
                 "end",
                 iid=iid,
+                tags=(tag,),
                 values=(
                     format_date_ru(str(session.get("date") or "")),
                     clock_short(str(session.get("startTime") or "")) or "—",
@@ -370,11 +381,40 @@ class ShiftsWindow(tk.Toplevel):
                 return session
         return None
 
+    def _paint_filters(self) -> None:
+        theme = self._theme
+        for value, label in _FILTERS:
+            button = self._filter_buttons.get(value)
+            if button is None:
+                continue
+            text = label
+            if value != "all":
+                text = f"{label}  {self._counts.get(value, 0)}"
+            selected = self._filter.get() == value
+            button.configure(
+                text=text,
+                bg=theme["button"] if selected else theme["card"],
+                fg=theme["button_text"] if selected else theme["text"],
+                activebackground=theme["button_hover"] if selected else theme["row"],
+                activeforeground=theme["button_text"] if selected else theme["text"],
+                highlightthickness=1,
+                highlightbackground=theme["button"] if selected else theme["line"],
+                highlightcolor=theme["button"] if selected else theme["line"],
+            )
+
     def _post(self, callback) -> None:
         try:
             self.after(0, callback)
         except (tk.TclError, RuntimeError):
             pass
+
+
+_FILTERS = (
+    ("all", "Все"),
+    (STATE_AT_WORK, "На работе"),
+    (STATE_AWAY, "Не на работе"),
+    (STATE_NEVER, "Ещё не сканировались"),
+)
 
 
 def _session_iid(session: dict) -> str:
@@ -395,14 +435,14 @@ def _ask_times(master, title: str, mode: str, initial: dict, theme: dict) -> dic
 
     def add(key: str, label: str, value: str) -> None:
         row = ttk.Frame(dialog)
-        row.pack(fill="x", padx=12, pady=4)
+        row.pack(fill="x", padx=18, pady=6)
         ttk.Label(row, text=label, width=22).pack(side="left")
         variable = tk.StringVar(value=value)
         ttk.Entry(row, textvariable=variable, width=24).pack(side="left")
         fields[key] = variable
 
     if mode == "end":
-        ttk.Label(dialog, text="Приход: " + str(initial.get("arrival") or "—")).pack(anchor="w", padx=12, pady=(12, 4))
+        ttk.Label(dialog, text="Приход: " + str(initial.get("arrival") or "—"), font=("", 12)).pack(anchor="w", padx=18, pady=(16, 6))
         add("end_date", "Дата ухода", str(initial.get("end_date") or ""))
         add("end_time", "Время ухода", str(initial.get("end_time") or ""))
     elif mode == "edit_closed":
@@ -412,19 +452,19 @@ def _ask_times(master, title: str, mode: str, initial: dict, theme: dict) -> dic
         add("end_time", "Время ухода", str(initial.get("end_time") or ""))
     else:
         note = "Новая смена откроется с этим временем." if mode == "start" else "Меняется только время прихода. Уход здесь не закрывается."
-        ttk.Label(dialog, text=note, wraplength=420, justify="left").pack(anchor="w", padx=12, pady=(12, 4))
+        ttk.Label(dialog, text=note, wraplength=440, justify="left").pack(anchor="w", padx=18, pady=(16, 6))
         add("date", "Дата прихода", str(initial.get("date") or ""))
         add("time", "Время прихода", str(initial.get("time") or ""))
 
     buttons = ttk.Frame(dialog)
-    buttons.pack(fill="x", padx=12, pady=12)
+    buttons.pack(fill="x", padx=18, pady=16)
 
     def accept() -> None:
         result.clear()
         result.update({key: variable.get().strip() for key, variable in fields.items()})
         dialog.destroy()
 
-    ttk.Button(buttons, text="Сохранить", command=accept).pack(side="right")
+    ttk.Button(buttons, text="Сохранить", command=accept, style="Accent.TButton").pack(side="right")
     ttk.Button(buttons, text="Отмена", command=dialog.destroy).pack(side="right", padx=8)
     dialog.grab_set()
     dialog.wait_window()

@@ -6,10 +6,13 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime
 from urllib.parse import quote
 
 from scanner_app.config import LOCAL_API_URL, server_urls
 from scanner_app.logging_setup import logger
+from scanner_app.logic import parse_iso
+from scanner_app.shifts import duration_minutes, is_open
 
 UNKNOWN_CODES = {
     "unknown_badge",
@@ -147,10 +150,70 @@ def _json_object(value) -> dict:
 
 
 def _shift_open(row: dict) -> bool:
-    """Идущая смена: уход ещё не проставлен. Старые ответы без endTime смотрят на status."""
-    if "endTime" in row:
-        return not str(row.get("endTime") or "").strip()
-    return row.get("status") == "active"
+    return is_open(row)
+
+
+def _event_moment(value) -> datetime:
+    """Время самой отметки, а не время, когда очередь дошла до сервера."""
+    parsed = parse_iso(str(value or ""))
+    if parsed is None:
+        return datetime.now().astimezone()
+    return parsed
+
+
+def _open_session(sessions: list, user_id) -> dict | None:
+    wanted = str(user_id)
+    rows = [
+        row
+        for row in sessions
+        if isinstance(row, dict) and str(row.get("userId")) == wanted and is_open(row)
+    ]
+    if not rows:
+        return None
+
+    def sort_key(row: dict) -> tuple:
+        text = str(row.get("id") or "")
+        if text.isdigit():
+            return (1, int(text))
+        return (0, 0)
+
+    rows.sort(key=sort_key)
+    return rows[-1]
+
+
+def _checkin_result(name: str, event: str) -> HttpResult:
+    action = "start" if event == "in" else "end"
+    return HttpResult(
+        True,
+        200,
+        {"success": True, "action": action, "event": event, "fullName": name, "name": name},
+        None,
+        False,
+    )
+
+
+def _checkin_unknown(result: HttpResult) -> bool:
+    data = result.data if isinstance(result.data, dict) else {}
+    code = str(data.get("error") or data.get("code") or "").lower()
+    message = str(data.get("message") or "").lower()
+    if code in UNKNOWN_CODES:
+        return True
+    return result.ok and ("не найден" in message or data.get("success") is False and "найден" in message)
+
+
+def _checkin_failed(result: HttpResult) -> bool:
+    data = result.data if isinstance(result.data, dict) else {}
+    if data.get("success") is False or data.get("ok") is False:
+        return True
+    return False
+
+
+def _checkin_needs_direct_write(result: HttpResult) -> bool:
+    if result.network_error or result.status in (401, 403, 408, 429):
+        return True
+    if result.status is not None and result.status >= 500:
+        return True
+    return False
 
 
 class ApiClient:
@@ -214,7 +277,7 @@ class ApiClient:
                     {
                         str(row.get("userId"))
                         for row in sessions.data
-                        if isinstance(row, dict) and not str(row.get("endTime") or "").strip()
+                        if isinstance(row, dict) and is_open(row)
                     }
                 )
             return f"В справочнике {len(people)} человек, с бейджем {len(with_badge)}, сейчас на работе {at_work}."
@@ -275,6 +338,7 @@ class ApiClient:
         hosted = self._supabase_get(
             "workSessions",
             "id,userId,date,startTime,endTime,durationMinutes,status,source,editedBy",
+            order="id.desc",
         )
         if isinstance(hosted.data, list) and not self._blocked(hosted):
             return hosted
@@ -318,11 +382,24 @@ class ApiClient:
             return None
         return {"apikey": key, "Authorization": "Bearer " + key}
 
-    def _supabase_get(self, table: str, select: str) -> HttpResult:
+    def canonical_badge(self, badge: str) -> str:
+        """Код как в справочнике, чтобы ручной ввод и скан попали в одну смену."""
+        text = str(badge or "").strip()
+        if not self.is_site or not text:
+            return text
+        found, _result = self._find_user(text)
+        if not isinstance(found, dict):
+            return text
+        current = str(found.get("badgeId") or "").strip()
+        return current or text
+
+    def _supabase_get(self, table: str, select: str, order: str = "") -> HttpResult:
         base, key = self._hosted_database()
         if not base or not key:
             return HttpResult(False, None, None, "Общая база сайта не настроена", True)
         url = base + "/rest/v1/" + table + "?select=" + quote(select, safe=",") + "&limit=1000"
+        if order:
+            url += "&order=" + quote(order, safe=".")
         result = self._request("GET", url, send_auth=False, extra_headers=self._supabase_headers())
         if isinstance(result.data, list):
             result.data = [_without_secrets(row) for row in result.data]
@@ -416,6 +493,18 @@ class ApiClient:
         return fallback, result
 
     def _post_checkin(self, payload: dict) -> HttpResult:
+        express = self._express_checkin(payload)
+        if express.ok and not self._blocked(express) and not _checkin_failed(express):
+            return express
+        if _checkin_unknown(express):
+            return express
+        if _checkin_needs_direct_write(express):
+            direct = self._write_checkin_shift(payload)
+            if direct is not None:
+                return direct
+        return express
+
+    def _express_checkin(self, payload: dict) -> HttpResult:
         base = self.write_url()
         if not base:
             return HttpResult(False, None, None, "Сервер не настроен", True)
@@ -433,6 +522,73 @@ class ApiClient:
             if token:
                 result = self._request("POST", url, {"badgeId": badge}, bearer=token)
         return result
+
+    def _write_checkin_shift(self, payload: dict) -> HttpResult | None:
+        """Та же запись смены, что сработала вчера из окна «Смены», если приём сканера закрыт."""
+        if not all(self._hosted_database()):
+            return None
+        badge = str(payload.get("badge") or payload.get("badgeId") or "").strip()
+        found, result = self._find_user(badge)
+        if found is None and (result.network_error or self._blocked(result) or not isinstance(result.data, list)):
+            return self._closed(result)
+        if found is None:
+            return HttpResult(False, 404, {"error": "unknown_badge", "message": "Сотрудник не найден"}, None, False)
+        sessions = self._directory_sessions()
+        if sessions.network_error or self._blocked(sessions) or not isinstance(sessions.data, list):
+            return self._closed(sessions)
+        name = str(found.get("fullName") or found.get("login") or "").strip()
+        event = str(payload.get("event") or "").strip().lower()
+        if event not in ("in", "out"):
+            event = "out" if _open_session(sessions.data, found.get("id")) else "in"
+        moment = _event_moment(payload.get("timestamp"))
+        logger().info("Отметка %s пишется в базу сайта", badge[:80])
+        if event == "in":
+            if _open_session(sessions.data, found.get("id")) is not None:
+                return _checkin_result(name, "in")
+            user_id = found.get("id")
+            text = str(user_id if user_id is not None else "").strip()
+            written = self.write_session(
+                {
+                    "op": "create",
+                    "payload": {
+                        "userId": int(text) if text.isdigit() else user_id,
+                        "date": moment.strftime("%Y-%m-%d"),
+                        "startTime": moment.strftime("%H:%M:%S"),
+                        "endTime": None,
+                        "durationMinutes": None,
+                        "status": "active",
+                        "source": "qr",
+                    },
+                }
+            )
+        else:
+            current = _open_session(sessions.data, found.get("id"))
+            if current is None or not str(current.get("id") or "").strip():
+                return HttpResult(False, None, None, "Открытая смена ещё не появилась на сервере.", True)
+            minutes = duration_minutes(
+                str(current.get("date") or ""),
+                str(current.get("startTime") or ""),
+                moment.strftime("%Y-%m-%d"),
+                moment.strftime("%H:%M:%S"),
+            )
+            written = self.write_session(
+                {
+                    "op": "update",
+                    "session_id": str(current.get("id")),
+                    "payload": {
+                        "endTime": moment.strftime("%H:%M:%S"),
+                        "durationMinutes": 0 if minutes is None else minutes,
+                        "status": "completed",
+                        "source": "qr",
+                    },
+                }
+            )
+        if written.ok and isinstance(written.data, dict):
+            written.data["fullName"] = name or extract_name(written.data)
+            written.data["name"] = written.data["fullName"]
+            written.data["action"] = "start" if event == "in" else "end"
+            written.data["event"] = event
+        return written
 
     def operator_profiles(self) -> tuple[list[dict], str]:
         """Профили, которыми можно отмечать смены. Пароли в список не входят."""
@@ -546,6 +702,11 @@ class ApiClient:
         )
 
     def _wall_message(self) -> str:
+        if all(self._hosted_database()):
+            return (
+                "Рабочий адрес закрыт входом Vercel. "
+                "Отметки и смены пишутся в ту же базу, которую показывает сайт."
+            )
         return (
             "Рабочий адрес есть, но Vercel пускает туда только после входа в команду. "
             "Пока защита включена, сканер с этого компьютера туда не попадёт. "

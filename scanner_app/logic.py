@@ -97,6 +97,25 @@ def normalize_badge(raw: str, scanner: dict) -> str:
     return text
 
 
+def manual_badge(raw: str, scanner: dict) -> str:
+    """Код, который человек вписал сам, а не тот, что прислал сканер.
+
+    Сначала действуют обычные правила сканера. Если из-за шаблона или
+    минимальной длины код отбрасывается, остаётся вписанный текст:
+    цифры, буквы и символы.
+    """
+    text = "".join(ch for ch in str(raw) if ch >= " " or ch == "\t").strip()
+    if not text:
+        return ""
+    recognized = normalize_badge(text, scanner)
+    if recognized:
+        return recognized
+    loose = dict(scanner)
+    loose["badge_regex"] = ""
+    loose["min_length"] = 1
+    return normalize_badge(text, loose)
+
+
 def decide_event(
     last_event: str | None,
     last_time: datetime | None,

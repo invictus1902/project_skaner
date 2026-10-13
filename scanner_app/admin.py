@@ -24,7 +24,7 @@ from scanner_app.fonts import faces
 from scanner_app.logic import format_history_time, parse_iso
 from scanner_app.scanner import list_serial_ports, probe_serial_port
 from scanner_app.shifts_ui import ShiftsWindow
-from scanner_app.theme import THEME_LABELS, theme_by_name
+from scanner_app.theme import THEME_LABELS, apply_ttk_style, theme_by_name
 from scanner_app.ui_helpers import Form, ScrollFrame
 
 TEMPLATE_LABELS = (
@@ -61,6 +61,28 @@ def _profile_label(person: dict) -> str:
     if login and login != name:
         return f"{name} — {login} ({role})"
     return f"{name} ({role})"
+
+
+def _paint_text(widget, theme: dict) -> None:
+    widget.configure(
+        bg=theme["entry"],
+        fg=theme["text"],
+        insertbackground=theme["text"],
+        relief="flat",
+        highlightthickness=0,
+        bd=0,
+    )
+    bar = getattr(widget, "vbar", None)
+    if bar is not None:
+        bar.configure(
+            bg=theme["row"],
+            troughcolor=theme["bg"],
+            activebackground=theme["line"],
+            highlightthickness=0,
+            bd=0,
+            relief="flat",
+            width=12,
+        )
 
 
 def _paint_button(widget: tk.Button, theme: dict, primary: bool) -> None:
@@ -100,7 +122,7 @@ def prompt_password(master, settings: dict, title: str = "Подтвержден
 
 
 class LoginDialog(tk.Toplevel):
-    def __init__(self, master, settings: dict, on_success, title: str = "Вход в админку") -> None:
+    def __init__(self, master, settings: dict, on_success, title: str = "Вход в настройки") -> None:
         super().__init__(master)
         self.settings = settings
         self.on_success = on_success
@@ -112,7 +134,14 @@ class LoginDialog(tk.Toplevel):
         self.configure(bg=theme["bg"])
         self.attributes("-topmost", True)
         tk.Label(self, text=title, bg=theme["bg"], fg=theme["text"], font=(serif, 22)).pack(padx=28, pady=(22, 8))
-        tk.Label(self, text="Пароль администратора", bg=theme["bg"], fg=theme["muted"], font=(sans, 11)).pack(padx=28, anchor="w")
+        tk.Label(self, text="Пароль настроек на этом компьютере", bg=theme["bg"], fg=theme["muted"], font=(sans, 11)).pack(padx=28, anchor="w")
+        tk.Label(
+            self,
+            text="Это не пароль профиля на сайте.",
+            bg=theme["bg"],
+            fg=theme["muted"],
+            font=(sans, 10),
+        ).pack(padx=28, anchor="w", pady=(2, 0))
         self.variable = tk.StringVar()
         self.entry = tk.Entry(
             self,
@@ -170,13 +199,13 @@ class AdminWindow(tk.Toplevel):
         super().__init__(master)
         self.app = app
         self.settings = app.settings
-        self.title("Админка — учёт рабочего времени")
+        self.title("Настройки")
         self.attributes("-topmost", True)
         self.minsize(860, 560)
-        width = min(1080, master.winfo_screenwidth() - 40)
-        height = min(760, master.winfo_screenheight() - 60)
-        x = master.winfo_rootx() + 20
-        y = master.winfo_rooty() + 20
+        width = min(1080, master.winfo_screenwidth() - 48)
+        height = min(760, master.winfo_screenheight() - 100)
+        x = max(0, min(master.winfo_rootx() + 24, master.winfo_screenwidth() - width))
+        y = max(0, min(master.winfo_rooty() + 24, max(0, master.winfo_screenheight() - height - 48)))
         self.geometry(f"{width}x{height}+{x}+{y}")
         _serif, _serif_bold, self.sans = faces(self)
         self._style_widgets()
@@ -209,84 +238,7 @@ class AdminWindow(tk.Toplevel):
         theme = theme_by_name(self.settings["ui"].get("theme") or "dark")
         self._theme = theme
         self.configure(bg=theme["bg"])
-        style = ttk.Style(self)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        bg = theme["bg"]
-        fg = theme["text"]
-        sans = self.sans
-        style.configure(".", background=bg, foreground=fg, font=(sans, 11))
-        style.configure("TFrame", background=bg)
-        style.configure("TLabel", background=bg, foreground=fg, font=(sans, 11))
-        style.configure("TCheckbutton", background=bg, foreground=fg, font=(sans, 11), indicatorcolor=theme["entry"])
-        style.map(
-            "TCheckbutton",
-            indicatorcolor=[("selected", theme["accent"]), ("!selected", theme["entry"])],
-            background=[("active", bg)],
-            foreground=[("disabled", theme["muted"])],
-        )
-        style.configure("TNotebook", background=bg, borderwidth=0)
-        style.configure(
-            "TNotebook.Tab",
-            padding=(14, 8),
-            background=theme["card"],
-            foreground=fg,
-            font=(sans, 11),
-            borderwidth=0,
-        )
-        style.map(
-            "TNotebook.Tab",
-            background=[("selected", theme["button"])],
-            foreground=[("selected", theme["button_text"])],
-        )
-        style.configure(
-            "TEntry",
-            fieldbackground=theme["entry"],
-            foreground=fg,
-            font=(sans, 11),
-            bordercolor=theme["line"],
-            lightcolor=theme["line"],
-            darkcolor=theme["line"],
-        )
-        style.configure(
-            "TCombobox",
-            fieldbackground=theme["entry"],
-            foreground=fg,
-            background=theme["card"],
-            arrowcolor=fg,
-            font=(sans, 11),
-            bordercolor=theme["line"],
-        )
-        style.map("TCombobox", fieldbackground=[("readonly", theme["entry"])])
-        style.configure(
-            "Treeview",
-            background=theme["entry"],
-            fieldbackground=theme["entry"],
-            foreground=fg,
-            font=(sans, 11),
-            rowheight=28,
-            bordercolor=theme["line"],
-        )
-        style.map("Treeview", background=[("selected", theme["button"])], foreground=[("selected", theme["button_text"])])
-        style.configure("Treeview.Heading", background=theme["header"], foreground=fg, font=(sans, 11, "bold"))
-        style.configure(
-            "TButton",
-            padding=(12, 6),
-            background=theme["button"],
-            foreground=theme["button_text"],
-            font=(sans, 11),
-            borderwidth=0,
-            focusthickness=1,
-            focuscolor=theme["accent"],
-        )
-        style.map(
-            "TButton",
-            background=[("active", theme["button_hover"]), ("pressed", theme["button_hover"])],
-            foreground=[("disabled", theme["muted"])],
-        )
-        style.configure("Vertical.TScrollbar", background=theme["card"], troughcolor=theme["bg"], arrowcolor=fg)
+        apply_ttk_style(ttk.Style(self), theme, self.sans)
 
     def _init_vars(self) -> None:
         server = self.settings["server"]
@@ -377,7 +329,8 @@ class AdminWindow(tk.Toplevel):
         ttk.Label(bar, textvariable=self.status_text).pack(side="left")
         ttk.Button(bar, text="Смены", command=self._open_shifts).pack(side="left", padx=(12, 0))
         ttk.Button(bar, text="Закрыть", command=self._close).pack(side="right")
-        ttk.Button(bar, text="Сохранить", command=self._save).pack(side="right", padx=8)
+        ttk.Button(bar, text="Сохранить", command=self._save, style="Accent.TButton").pack(side="right", padx=8)
+        bar.lift()
         self._load_profiles()
 
     def _scroll_form(self, title: str) -> tuple[ScrollFrame, Form]:
@@ -386,6 +339,7 @@ class AdminWindow(tk.Toplevel):
         scroll.inner.columnconfigure(0, weight=1)
         form = Form(scroll.inner)
         form.grid(row=0, column=0, sticky="ew")
+        ttk.Frame(scroll.inner, height=16).grid(row=1, column=0)
         if title:
             form.label(title)
         return scroll, form
@@ -415,7 +369,11 @@ class AdminWindow(tk.Toplevel):
             row=form.row, column=0, columnspan=2, sticky="w", padx=10, pady=(4, 8)
         )
         form.row += 1
-        form.buttons(("Войти", self._sign_in), ("Выйти из профиля", self._sign_out), ("Обновить список профилей", self._load_profiles))
+        form.buttons(
+            ("Войти", self._sign_in, "Accent.TButton"),
+            ("Выйти из профиля", self._sign_out),
+            ("Обновить список профилей", self._load_profiles),
+        )
         form.label("Дальше — таймаут, ключ доступа и настройки другого сервера.")
         form.entry("Таймаут, секунды", self.timeout)
         form.entry("Идентификатор этого компьютера", self.device_id)
@@ -474,31 +432,37 @@ class AdminWindow(tk.Toplevel):
         form.check("Короткий сигнал динамика", self.beep)
         form.entry("Скорость голоса, от −10 до 10", self.rate)
         form.entry("Громкость, от 0 до 100", self.volume)
-        ttk.Label(form, text="Голос").grid(row=form.row, column=0, sticky="w", padx=10, pady=4)
+        ttk.Label(form, text="Голос").grid(row=form.row, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
+        form.row += 1
         self.voice_box = ttk.Combobox(form, textvariable=self.voice_choice, state="readonly", width=58)
-        self.voice_box.grid(row=form.row, column=1, sticky="ew", padx=10, pady=4)
+        self.voice_box.grid(row=form.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 4))
         form.row += 1
         form.buttons(("Произнести пример", self._test_voice), ("Обновить список голосов", self._load_voices))
         self.template_boxes = {}
         for key, label in TEMPLATE_LABELS:
-            ttk.Label(form, text=label).grid(row=form.row, column=0, sticky="nw", padx=10, pady=4)
-            box = tk.Text(form, height=2, width=60, wrap="word", relief="flat", bd=1)
+            ttk.Label(form, text=label).grid(row=form.row, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
+            form.row += 1
+            box = tk.Text(form, height=2, width=60, wrap="word", relief="flat", bd=0)
             box.configure(
                 bg=self._theme["entry"],
                 fg=self._theme["text"],
                 insertbackground=self._theme["text"],
                 font=(self.sans, 11),
+                highlightthickness=1,
+                highlightbackground=self._theme["line"],
+                highlightcolor=self._theme["accent"],
             )
             box.insert("1.0", (self.settings["voice"].get("templates") or {}).get(key, ""))
-            box.grid(row=form.row, column=1, sticky="ew", padx=10, pady=4)
+            box.grid(row=form.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 4))
             self.template_boxes[key] = box
             form.row += 1
         return scroll
 
     def _look_tab(self) -> ScrollFrame:
-        scroll, form = self._scroll_form("Экран рассчитан на то, чтобы результат было видно издалека.")
+        scroll, form = self._scroll_form("")
         form.entry("Заголовок", self.title_text)
-        ttk.Label(form, text="Тема").grid(row=form.row, column=0, sticky="w", padx=10, pady=4)
+        ttk.Label(form, text="Тема").grid(row=form.row, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
+        form.row += 1
         theme_box = ttk.Combobox(
             form,
             textvariable=self.theme_choice,
@@ -506,7 +470,7 @@ class AdminWindow(tk.Toplevel):
             values=[label for _key, label in THEME_LABELS],
             width=40,
         )
-        theme_box.grid(row=form.row, column=1, sticky="w", padx=10, pady=4)
+        theme_box.grid(row=form.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 4))
         form.row += 1
         form.entry("Размер шрифта, от 0.7 до 2.2", self.font_scale)
         form.entry("Сколько секунд показывать результат", self.hold_sec)
@@ -514,11 +478,19 @@ class AdminWindow(tk.Toplevel):
         form.check("Показывать номер бейджа на экране", self.show_badge)
         form.check("Предупреждать о русской раскладке", self.warn_layout)
         form.check("Спрашивать пароль при закрытии программы", self.lock_exit)
+        note = "Пустые поля оставляют старый пароль. Новый пароль — не короче 4 символов."
         if password_is_default(self.settings):
-            form.label("Сейчас стоит пароль по умолчанию: admin. Смените его.")
-        form.entry("Новый пароль", self.new_password, show="*")
-        form.entry("Повтор нового пароля", self.confirm_password, show="*")
-        form.label("Пустые поля пароля оставляют старый пароль. Новый пароль — не короче 4 символов.")
+            note = "Сейчас стоит пароль по умолчанию: admin. Смените его. " + note
+        form.label(note)
+        pair = ttk.Frame(form)
+        pair.grid(row=form.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(4, 8))
+        pair.columnconfigure(0, weight=1)
+        pair.columnconfigure(1, weight=1)
+        ttk.Label(pair, text="Новый пароль").grid(row=0, column=0, sticky="w")
+        ttk.Label(pair, text="Повтор нового пароля").grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Entry(pair, textvariable=self.new_password, show="*").grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        ttk.Entry(pair, textvariable=self.confirm_password, show="*").grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(2, 0))
+        form.row += 1
         return scroll
 
     def _log_tab(self) -> ttk.Frame:
@@ -530,22 +502,22 @@ class AdminWindow(tk.Toplevel):
         ttk.Button(bar, text="Открыть папку", command=self._open_logs).pack(side="left", padx=4)
         ttk.Button(bar, text="Очистить журнал", command=self._clear_logs).pack(side="left", padx=4)
         self.log_text = scrolledtext.ScrolledText(frame, wrap="word", font=(self.sans, 10), relief="flat")
-        self.log_text.configure(bg=self._theme["entry"], fg=self._theme["text"])
+        _paint_text(self.log_text, self._theme)
         self.log_text.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.log_text.configure(state="disabled")
         return frame
 
     def _tools_tab(self) -> ScrollFrame:
         scroll, form = self._scroll_form("Проверка без настоящего сервера и управление этим компьютером.")
-        form.entry("Код для проверки", self.sim_code)
-        form.buttons(("Имитировать сканирование", self._simulate))
+        form.entry("Код бейджа: цифры, буквы или символы", self.sim_code)
+        form.buttons(("Отметить этим кодом", self._simulate, "Accent.TButton"))
         self.result_label = ttk.Label(form, text="Последний результат появится здесь.", wraplength=860, justify="left")
         self.result_label.grid(row=form.row, column=0, columnspan=2, sticky="w", padx=10, pady=4)
         form.row += 1
         ttk.Label(form, text="Протокол сканера").grid(row=form.row, column=0, columnspan=2, sticky="w", padx=10)
         form.row += 1
         self.debug_text = scrolledtext.ScrolledText(form, height=6, wrap="word", font=(self.sans, 10), relief="flat")
-        self.debug_text.configure(bg=self._theme["entry"], fg=self._theme["text"])
+        _paint_text(self.debug_text, self._theme)
         self.debug_text.grid(row=form.row, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
         self.debug_text.configure(state="disabled")
         form.row += 1
@@ -918,7 +890,7 @@ class AdminWindow(tk.Toplevel):
         if not code:
             self.status_text.set("Введите код бейджа")
             return
-        self.app.service.submit_scan(code)
+        self.app.service.submit_manual(code)
         self.status_text.set("Код отправлен в обработку")
 
     def _on_debug(self, text: str) -> None:

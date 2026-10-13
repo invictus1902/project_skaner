@@ -34,35 +34,39 @@ class Form(ttk.Frame):
         self.row = 0
 
     def combo(self, label: str, variable, values=(), width: int = 62):
-        ttk.Label(self, text=label).grid(row=self.row, column=0, sticky="w", padx=10, pady=4)
+        ttk.Label(self, text=label).grid(row=self.row, column=0, columnspan=2, sticky="w", padx=16, pady=(8, 2))
+        self.row += 1
         widget = ttk.Combobox(self, textvariable=variable, values=values, width=width)
-        widget.grid(row=self.row, column=1, sticky="ew", padx=10, pady=4)
+        widget.grid(row=self.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 2))
         self.row += 1
         return widget
 
     def entry(self, label: str, variable, show=None, width: int = 62):
-        ttk.Label(self, text=label).grid(row=self.row, column=0, sticky="w", padx=10, pady=4)
+        ttk.Label(self, text=label).grid(row=self.row, column=0, columnspan=2, sticky="w", padx=16, pady=(8, 2))
+        self.row += 1
         widget = ttk.Entry(self, textvariable=variable, show=show, width=width)
-        widget.grid(row=self.row, column=1, sticky="ew", padx=10, pady=4)
+        widget.grid(row=self.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 2))
         self.row += 1
         return widget
 
     def check(self, text: str, variable):
         widget = ttk.Checkbutton(self, text=text, variable=variable)
-        widget.grid(row=self.row, column=0, columnspan=2, sticky="w", padx=10, pady=3)
+        widget.grid(row=self.row, column=0, columnspan=2, sticky="w", padx=16, pady=2)
         self.row += 1
         return widget
 
     def label(self, text: str, wrap: int = 880):
         widget = ttk.Label(self, text=text, wraplength=wrap, justify="left")
-        widget.grid(row=self.row, column=0, columnspan=2, sticky="w", padx=10, pady=6)
+        widget.grid(row=self.row, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
         self.row += 1
         return widget
 
     def buttons(self, *pairs):
         frame = ttk.Frame(self)
-        frame.grid(row=self.row, column=0, columnspan=2, sticky="w", padx=10, pady=8)
-        for text, command in pairs:
-            ttk.Button(frame, text=text, command=command).pack(side="left", padx=(0, 8))
+        frame.grid(row=self.row, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 12))
+        for item in pairs:
+            text, command = item[0], item[1]
+            style_name = item[2] if len(item) > 2 else "TButton"
+            ttk.Button(frame, text=text, command=command, style=style_name).pack(side="left", padx=(0, 8))
         self.row += 1
         return frame

@@ -15,6 +15,7 @@ from scanner_app.logic import (
     decide_event,
     event_phrase,
     format_when,
+    manual_badge,
     normalize_badge,
     parse_iso,
     render_speech,
@@ -78,6 +79,10 @@ class AttendanceService:
     def submit_scan(self, raw: str) -> None:
         self._scans.put(str(raw))
 
+    def submit_manual(self, raw: str) -> None:
+        """Код, вписанный с клавиатуры, когда сканер недоступен."""
+        self._scans.put(("manual", str(raw)))
+
     def on_burst(self, text: str, duration: float, terminated: bool, fast: bool) -> None:
         del terminated
         short = " ".join(str(text).split())[:180]
@@ -95,9 +100,13 @@ class AttendanceService:
             raw = self._scans.get()
             if raw is None:
                 return
+            manual = False
+            if isinstance(raw, tuple):
+                manual = raw[0] == "manual"
+                raw = raw[1] if len(raw) > 1 else ""
             try:
                 with self._io_lock:
-                    self._process(raw)
+                    self._process(str(raw), manual=manual)
             except Exception:
                 logger().exception("Ошибка обработки кода")
                 self.ui.show(
@@ -122,19 +131,21 @@ class AttendanceService:
             if self._stop.wait(max(5, delay)):
                 return
 
-    def _process(self, raw: str) -> None:
+    def _process(self, raw: str, manual: bool = False) -> None:
         settings = copy.deepcopy(self.settings)
         scanner = settings.get("scanner") or {}
-        badge = normalize_badge(raw, scanner)
+        badge = manual_badge(raw, scanner) if manual else normalize_badge(raw, scanner)
+        if badge:
+            badge = self._canonical_badge(badge)
         if not badge:
             logger().warning("Код не распознан: %s", " ".join(str(raw).split())[:200])
             self._present(
                 settings,
                 state="error",
-                title="КОД НЕ РАСПОЗНАН",
+                title="Введите код" if manual else "КОД НЕ РАСПОЗНАН",
                 name="",
                 when="",
-                detail="Сканер передал код, который не похож на бейдж.",
+                detail="Напишите код бейджа: цифры, буквы или символы." if manual else "Сканер передал код, который не похож на бейдж.",
                 badge="",
                 template="unknown",
                 beep_kind="error",
@@ -142,6 +153,8 @@ class AttendanceService:
                 speech_name="",
             )
             return
+        if manual:
+            logger().info("Код введён вручную: %s", badge[:80])
 
         cooldown = float(scanner.get("cooldown_sec") or 0)
         now_mono = time.monotonic()
@@ -216,6 +229,13 @@ class AttendanceService:
         if not server_configured(settings.get("server")):
             self._finish_local(settings, screen_name, speech_name, badge, event, when, spoken, "Сервер не настроен. Запись сохранена на этом компьютере.")
             return
+        # Сайт не смотрит тип отметки, а переключает открытую смену.
+        # Нельзя отправить уход, пока предыдущий приход ещё лежит в очереди.
+        if self.db.has_older_pending(badge, event_id):
+            message = "Отметка сохранена. Она уйдёт на сервер сразу после предыдущей."
+            self.db.mark_retry(event_id, message)
+            self._finish_local(settings, screen_name, speech_name, badge, event, when, spoken, message)
+            return
 
         result = self.api.post_event(payload)
         kind, message = classify_post(result)
@@ -253,8 +273,20 @@ class AttendanceService:
             return "ok", name
         return "skip", cached_name
 
+    def _canonical_badge(self, badge: str) -> str:
+        resolve = getattr(self.api, "canonical_badge", None)
+        if resolve is None:
+            return badge
+        try:
+            resolved = str(resolve(badge) or "").strip()
+        except Exception:
+            logger().exception("Не удалось сверить код бейджа со справочником")
+            return badge
+        return resolved or badge
+
     def _choose_event(self, badge: str, employee_name: str, now: datetime, settings: dict) -> tuple[str, bool, str]:
         name = employee_name
+        server_event = None
         status = self.api.get_status(badge)
         if status is not None and not status.network_error and status.ok and isinstance(status.data, dict):
             data = status.data
@@ -262,20 +294,28 @@ class AttendanceService:
             if server_name:
                 name = name or server_name
                 self.db.upsert_employee(badge, server_name, "server")
-            if "last_event" in data and not extract_event(data):
-                return "in", False, name
-            server_event = extract_event(data)
-            if server_event == "in":
-                return "out", False, name
-            if server_event == "out":
-                return "in", False, name
+            if any(key in data for key in ("last_event", "event", "type", "event_type", "action")):
+                server_event = extract_event(data)
 
+        # Пока отметка лежит в очереди, сервер о ней не знает и отвечает «не на работе».
+        # Иначе каждый следующий скан снова открывает смену.
+        self.db.suppress_repeated_pending(badge)
         last = self.db.last_counted_event(badge)
         last_event = last["event_type"] if last else None
         last_time = parse_iso(last["scanned_at"]) if last else None
         if last_time is not None and last_time.tzinfo is None:
             last_time = last_time.replace(tzinfo=now.tzinfo)
         max_hours = float(settings.get("attendance", {}).get("shift_max_hours") or 16)
+        if last and last.get("status") == "pending":
+            event = decide_event(last_event, last_time, now, max_hours)
+            abandoned = last_event == "in" and event == "in"
+            return event, abandoned, name
+        if server_event == "in":
+            return "out", False, name
+        if server_event == "out":
+            return "in", False, name
+        if server_event == "":
+            return "in", False, name
         event = decide_event(last_event, last_time, now, max_hours)
         abandoned = last_event == "in" and event == "in"
         return event, abandoned, name
@@ -362,7 +402,12 @@ class AttendanceService:
         self._finish_local(settings, screen_name, speech_name, badge, event, when, spoken, "Нет связи с сервером. Запись будет отправлена позже.")
 
     def _finish_local(self, settings, screen_name, speech_name, badge, event, when, spoken, detail) -> None:
-        title = "СОХРАНЕНО"
+        if event == "in":
+            title = "ПРИХОД"
+        elif event == "out":
+            title = "УХОД"
+        else:
+            title = "СОХРАНЕНО"
         logger().info("Скан %s → %s, %s, локально", badge, event, screen_name)
         self._present(
             settings,
@@ -457,6 +502,11 @@ class AttendanceService:
         self.ui.set_pending(pending_count)
         if not server_configured(settings.get("server")):
             return
+        seen = []
+        for row in self.db.pending_events(limit=50):
+            if row["badge"] not in seen:
+                seen.append(row["badge"])
+                self.db.suppress_repeated_pending(row["badge"])
         for row in self.db.pending_events(limit=20):
             if self._stop.is_set():
                 return
