@@ -27,6 +27,7 @@ EVENT_TEXT = {
 }
 STATUS_TEXT = {
     "pending": "в очереди",
+    "sending": "отправляется",
     "sent": "отправлено",
     "rejected": "отклонено",
 }
@@ -90,10 +91,13 @@ class KioskApp:
         self._result_subs: list = []
         self._admin = None
         self._login = None
+        self._shifts = None
+        self._hold_fullscreen = False
+        self._window_placed = False
 
         self.root = tk.Tk()
         self.root.title(self.settings["ui"]["title"])
-        self.root.minsize(960, 640)
+        self.root.minsize(800, 560)
         self.root.report_callback_exception = self._report_error
         self.serif, self.serif_bold, self.sans = faces(self.root)
         self.fonts = {
@@ -220,28 +224,50 @@ class KioskApp:
     def open_admin(self) -> None:
         from scanner_app.admin import AdminWindow, LoginDialog
 
-        if self._admin is not None and self._admin.winfo_exists():
-            self._admin.lift()
-            self._admin.focus_force()
+        from scanner_app.ui_helpers import present_window, widget_alive
+
+        if widget_alive(self._admin):
+            present_window(self._admin)
             return
-        if self._login is not None and self._login.winfo_exists():
-            self._login.lift()
+        if widget_alive(self._login):
+            try:
+                self._login.deiconify()
+                self._login.lift()
+                self._login.focus_force()
+            except tk.TclError:
+                pass
             return
 
         def opened() -> None:
             self._login = None
+            self._hold_fullscreen = True
+            self._apply_window_mode()
             self._admin = AdminWindow(self.root, self)
+            self._hold_fullscreen = False
             self._admin.protocol("WM_DELETE_WINDOW", self._close_admin)
 
         self._login = LoginDialog(self.root, self.settings, opened)
 
+    def open_shifts(self) -> None:
+        from scanner_app.shifts_ui import ShiftsWindow
+        from scanner_app.ui_helpers import present_window, widget_alive
+
+        if widget_alive(self._shifts):
+            present_window(self._shifts)
+            return
+        self._hold_fullscreen = True
+        self._apply_window_mode()
+        self._shifts = ShiftsWindow(self.root, self)
+        self._hold_fullscreen = False
+
     def _close_admin(self) -> None:
-        if self._admin is not None:
-            try:
-                self._admin.destroy()
-            except tk.TclError:
-                pass
-        self._admin = None
+        admin = self._admin
+        if admin is None:
+            return
+        try:
+            admin._close()
+        except tk.TclError:
+            self._admin = None
 
     def _build(self) -> None:
         self.header = tk.Frame(self.root)
@@ -294,48 +320,52 @@ class KioskApp:
         self.history_rows.pack(fill="x", padx=8, pady=6)
 
         self.footer = tk.Frame(self.root)
+        self.action_row = tk.Frame(self.footer)
+        self.meta_row = tk.Frame(self.footer)
         self.manual_var = tk.StringVar()
-        self.manual_label = tk.Label(self.footer, text="Код бейджа", anchor="w", font=self.fonts["small"])
+        self.manual_label = tk.Label(self.action_row, text="Код бейджа", anchor="w", font=self.fonts["small"])
         self.manual_entry = tk.Entry(
-            self.footer,
+            self.action_row,
             textvariable=self.manual_var,
             font=self.fonts["footer"],
             relief="flat",
             highlightthickness=1,
         )
         self.manual_button = tk.Button(
-            self.footer,
+            self.action_row,
             text="Отметить",
             font=self.fonts["small"],
             relief="flat",
-            padx=16,
-            pady=6,
+            padx=18,
+            pady=4,
             cursor="hand2",
             command=self._submit_manual,
         )
-        self.hint_label = tk.Label(self.footer, text="F12 — настройки", anchor="w", font=self.fonts["small"])
-        self.pending_label = tk.Label(self.footer, anchor="w", font=self.fonts["small"])
-        self.voice_label = tk.Label(self.footer, anchor="w", font=self.fonts["small"])
-        self.version_label = tk.Label(self.footer, text=f"v{APP_VERSION}", anchor="e", font=self.fonts["small"])
+        self.hint_label = tk.Label(self.meta_row, text="F12 — настройки", anchor="w", font=self.fonts["small"])
+        self.pending_label = tk.Label(self.meta_row, anchor="w", font=self.fonts["small"])
+        self.voice_label = tk.Label(self.meta_row, anchor="w", font=self.fonts["small"])
+        self.version_label = tk.Label(self.meta_row, text=f"v{APP_VERSION}", anchor="e", font=self.fonts["small"])
         self.admin_button = tk.Button(
-            self.footer,
+            self.meta_row,
             text="Настройки",
             font=self.fonts["small"],
             relief="flat",
             padx=16,
-            pady=6,
+            pady=4,
             cursor="hand2",
             command=self.open_admin,
         )
-        self.footer.columnconfigure(1, weight=1)
-        self.manual_label.grid(row=0, column=0, sticky="w", padx=(20, 8), pady=12)
-        self.manual_entry.grid(row=0, column=1, sticky="ew", pady=12)
-        self.manual_button.grid(row=0, column=2, sticky="w", padx=(8, 12), pady=10)
-        self.hint_label.grid(row=0, column=3, sticky="w", padx=(4, 8))
-        self.pending_label.grid(row=0, column=4, sticky="w", padx=4)
-        self.voice_label.grid(row=0, column=5, sticky="w", padx=4)
-        self.version_label.grid(row=0, column=6, sticky="e", padx=4)
-        self.admin_button.grid(row=0, column=7, sticky="e", padx=(8, 20), pady=10)
+        self.action_row.columnconfigure(1, weight=1)
+        self.manual_label.grid(row=0, column=0, sticky="w", padx=(16, 10), pady=8)
+        self.manual_entry.grid(row=0, column=1, sticky="ew", pady=8, ipady=6, ipadx=8)
+        self.manual_button.grid(row=0, column=2, sticky="nsew", padx=(10, 16), pady=8)
+        self.hint_label.pack(side="left", padx=(16, 12), pady=(0, 8))
+        self.pending_label.pack(side="left", padx=(0, 12), pady=(0, 8))
+        self.voice_label.pack(side="left", padx=(0, 12), pady=(0, 8))
+        self.admin_button.pack(side="right", padx=(8, 16), pady=(0, 8))
+        self.version_label.pack(side="right", padx=(8, 4), pady=(0, 8))
+        self.action_row.pack(fill="x")
+        self.meta_row.pack(fill="x")
         self.manual_entry.bind("<Return>", self._submit_manual)
         self.manual_entry.bind("<FocusIn>", self._manual_focus)
         self.manual_entry.bind("<FocusOut>", self._manual_blur)
@@ -490,7 +520,7 @@ class KioskApp:
             if row["event_type"] in ("unknown", "disabled") or row["status"] == "rejected":
                 event_color = theme["error_text"]
             status_color = theme["muted"]
-            if row["status"] == "pending":
+            if row["status"] in ("pending", "sending"):
                 status_color = theme["warn_text"]
             elif row["status"] == "rejected":
                 status_color = theme["error_text"]
@@ -611,14 +641,27 @@ class KioskApp:
         threading.Thread(target=run, name="health", daemon=True).start()
 
     def _apply_window_mode(self) -> None:
+        from scanner_app.ui_helpers import place_window, widget_alive
+
         fullscreen = bool(self.settings["ui"].get("fullscreen")) and not self._force_windowed
+        if self._hold_fullscreen or widget_alive(self._admin) or widget_alive(self._shifts):
+            fullscreen = False
+        was_fullscreen = bool(self.root.attributes("-fullscreen"))
         self.root.attributes("-fullscreen", fullscreen)
-        if not fullscreen:
-            screen_w = self.root.winfo_screenwidth()
-            screen_h = self.root.winfo_screenheight()
-            width = min(1280, max(960, screen_w - 48))
-            height = min(800, max(640, screen_h - 96))
-            self.root.geometry(f"{width}x{height}")
+        if fullscreen:
+            self._window_placed = False
+            return
+        if was_fullscreen or not self._window_placed:
+            beside = self._hold_fullscreen or widget_alive(self._admin) or widget_alive(self._shifts)
+            place_window(
+                self.root,
+                1100 if beside else 1200,
+                720 if beside else 740,
+                min_width=800,
+                min_height=560,
+                align="left" if beside else "center",
+            )
+            self._window_placed = True
 
     def _toggle_fullscreen(self, _event=None):
         self.settings["ui"]["fullscreen"] = not bool(self.settings["ui"].get("fullscreen"))
@@ -667,6 +710,8 @@ class KioskApp:
         self.header.configure(bg=theme["header"])
         self.status_row.configure(bg=theme["header"])
         self.footer.configure(bg=theme["header"])
+        self.action_row.configure(bg=theme["card"])
+        self.meta_row.configure(bg=theme["header"])
         self.header_rule.configure(bg=theme["line"])
         self.footer_rule.configure(bg=theme["line"])
         self.dot.configure(bg=theme["header"])
@@ -685,7 +730,7 @@ class KioskApp:
         self.pending_label.configure(bg=theme["header"])
         self.voice_label.configure(bg=theme["header"], fg=theme["warn_text"])
         self.version_label.configure(bg=theme["header"], fg=theme["muted"])
-        self.manual_label.configure(bg=theme["header"], fg=theme["muted"])
+        self.manual_label.configure(bg=theme["card"], fg=theme["text"])
         self.manual_entry.configure(
             bg=theme["entry"],
             fg=theme["text"],

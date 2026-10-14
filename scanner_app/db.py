@@ -59,6 +59,8 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_session_ops_status ON session_ops(status, id);
                 """
             )
+            # После сбоя программа могла остаться на середине отправки.
+            self._conn.execute("UPDATE events SET status = 'pending' WHERE status = 'sending'")
             self._conn.commit()
 
     def close(self) -> None:
@@ -155,28 +157,58 @@ class Database:
             )
             self._conn.commit()
 
+    def claim_event(self, event_id: int) -> bool:
+        """Занять отметку перед отправкой, чтобы её не послали второй раз."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE events SET status = 'sending' WHERE id = ? AND status = 'pending'",
+                (int(event_id),),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def next_pending_id(self, badge: str) -> int | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT id FROM events
+                WHERE badge = ? AND status = 'pending'
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (badge,),
+            ).fetchone()
+        return int(row["id"]) if row else None
+
     def suppress_repeated_pending(self, badge: str) -> int:
         """Убрать из очереди повторы той же отметки подряд.
 
-        Остаётся последняя отметка серии: у сайта каждая отправка переключает
-        смену, а более ранний дубль не должен затирать новый приход.
+        Остаётся последняя отметка серии. Уже отправляемую отметку нельзя
+        отменить, поэтому более новый повтор того же типа отбрасывается.
         """
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, event_type FROM events
-                WHERE badge = ? AND status = 'pending'
+                SELECT id, event_type, status FROM events
+                WHERE badge = ? AND status IN ('pending', 'sending')
                 ORDER BY id ASC
                 """,
                 (badge,),
             ).fetchall()
-            previous = None
-            remove_ids = []
-            for row in reversed(rows):
-                if previous == row["event_type"]:
-                    remove_ids.append(int(row["id"]))
+            groups: list[list] = []
+            for row in rows:
+                if not groups or groups[-1][0]["event_type"] != row["event_type"]:
+                    groups.append([row])
                 else:
-                    previous = row["event_type"]
+                    groups[-1].append(row)
+            remove_ids = []
+            for group in groups:
+                pending = [row for row in group if row["status"] == "pending"]
+                sending = [row for row in group if row["status"] == "sending"]
+                if sending:
+                    remove_ids.extend(int(row["id"]) for row in pending)
+                elif len(pending) > 1:
+                    remove_ids.extend(int(row["id"]) for row in pending[:-1])
             reason = "Повтор той же отметки, пока прошлая ещё не отправлена."
             for event_id in remove_ids:
                 self._conn.execute(
@@ -192,7 +224,7 @@ class Database:
             row = self._conn.execute(
                 """
                 SELECT 1 AS hit FROM events
-                WHERE badge = ? AND status = 'pending' AND id < ?
+                WHERE badge = ? AND status IN ('pending', 'sending') AND id < ?
                 LIMIT 1
                 """,
                 (badge, int(event_id)),
@@ -205,7 +237,7 @@ class Database:
                 """
                 SELECT id, badge, name, event_type, scanned_at, status
                 FROM events
-                WHERE badge = ? AND status IN ('pending', 'sent')
+                WHERE badge = ? AND status IN ('pending', 'sending', 'sent')
                 ORDER BY id DESC
                 LIMIT 1
                 """,
@@ -243,7 +275,7 @@ class Database:
     def count_pending(self) -> int:
         with self._lock:
             row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM events WHERE status = 'pending'"
+                "SELECT COUNT(*) AS n FROM events WHERE status IN ('pending', 'sending')"
             ).fetchone()
         return int(row["n"]) if row else 0
 

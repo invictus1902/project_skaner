@@ -162,7 +162,7 @@ class ScannerController:
             min_length=int(scanner.get("min_length") or 3),
             max_length=int(scanner.get("max_length") or 512),
             max_interval_ms=int(scanner.get("max_interval_ms") or 80),
-            idle_flush_ms=int(scanner.get("idle_flush_ms") or 200),
+            idle_flush_ms=int(scanner.get("idle_flush_ms") or 100),
             terminators=list(scanner.get("terminators") or ["enter"]),
             on_burst=self.on_burst,
         )

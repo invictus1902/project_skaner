@@ -57,7 +57,7 @@ def default_settings() -> dict:
             "min_length": 3,
             "max_length": 512,
             "max_interval_ms": 80,
-            "idle_flush_ms": 200,
+            "idle_flush_ms": 100,
             "terminators": ["enter", "tab"],
             "strip_aim_prefix": True,
             "strip_prefix": "",
@@ -204,7 +204,7 @@ def normalize_settings(settings: dict) -> dict:
     scanner["min_length"] = int(scanner.get("min_length") or 3)
     scanner["max_length"] = int(scanner.get("max_length") or 512)
     scanner["max_interval_ms"] = int(scanner.get("max_interval_ms") or 80)
-    scanner["idle_flush_ms"] = int(scanner.get("idle_flush_ms") or 200)
+    scanner["idle_flush_ms"] = int(scanner.get("idle_flush_ms") or 100)
     scanner["terminators"] = [item for item in (scanner.get("terminators") or []) if item in ("enter", "tab")]
     scanner["strip_aim_prefix"] = bool(scanner.get("strip_aim_prefix"))
     scanner["strip_prefix"] = str(scanner.get("strip_prefix") or "")

@@ -226,7 +226,7 @@ class ShiftBook:
         self.api = api
 
     def load(self) -> dict:
-        users_result, sessions_result = self.api.load_people()
+        users_result, sessions_result = self.api.load_people(refresh=True)
         offline = False
         message = ""
         if isinstance(getattr(users_result, "data", None), list) and not self.api._blocked(users_result):

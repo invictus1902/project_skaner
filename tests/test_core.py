@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -347,6 +350,122 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(client.canonical_badge("55001"), "55001")
         self.assertEqual(client.canonical_badge("  55001  "), "55001")
 
+    def test_directory_is_remembered_and_a_closed_host_is_skipped(self) -> None:
+        wall = '{"message":"Protected by Vercel Authentication","protection":{"vercel_auth_enabled":true}}'
+        hits = {"host": 0, "users": 0, "sessions": 0}
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            if "db.test" not in url:
+                hits["host"] += 1
+                return 401, wall.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/users" in url:
+                hits["users"] += 1
+                return 200, '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001"}]'.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/workSessions" in url:
+                hits["sessions"] += 1
+                return 200, b"[]"
+            return 500, b""
+
+        settings = default_settings()
+        settings["server"]["read_url"] = "https://example.test"
+        settings["server"]["write_url"] = "https://example.test"
+        settings["server"]["base_url"] = "https://example.test"
+        settings["server"]["supabase_url"] = "https://db.test"
+        settings["server"]["supabase_key"] = "anon-key"
+        client = ApiClient(settings, transport=transport)
+        self.assertEqual(client.get_employee("adm001").data["fullName"], "Эмир")
+        self.assertEqual(client.get_status("adm001").data["last_event"], "out")
+        self.assertEqual(hits, {"host": 1, "users": 1, "sessions": 1})
+        client.update(copy.deepcopy(settings))
+        self.assertEqual(client.get_employee("ADM001").data["fullName"], "Эмир")
+        self.assertEqual(client.get_status("adm001").data["last_event"], "out")
+        self.assertEqual(hits, {"host": 1, "users": 1, "sessions": 1})
+        users, _sessions = client.load_people()
+        users.data.clear()
+        again, _sessions = client.load_people()
+        self.assertEqual(again.data[0]["fullName"], "Эмир")
+        self.assertEqual(hits["users"], 1)
+        changed = copy.deepcopy(settings)
+        changed["server"]["read_url"] = "https://other.test"
+        changed["server"]["write_url"] = "https://other.test"
+        changed["server"]["base_url"] = "https://other.test"
+        client.update(changed)
+        client.get_employee("adm001")
+        self.assertGreater(hits["host"], 1)
+
+    def test_written_shift_stays_in_memory_for_the_next_scan(self) -> None:
+        wall = '{"message":"Protected by Vercel Authentication","protection":{"vercel_auth_enabled":true}}'
+        store = {"rows": []}
+        gets = {"sessions": 0}
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            if "example.test" in url:
+                return 401, wall.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/users" in url:
+                return 200, '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001"}]'.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/workSessions" in url:
+                gets["sessions"] += 1
+                return 200, b"[]"
+            if request.method == "POST" and "/rest/v1/workSessions" in url:
+                body = json.loads(request.data.decode("utf-8"))
+                row = {
+                    "id": 5,
+                    "userId": body["userId"],
+                    "date": body["date"],
+                    "startTime": body["startTime"],
+                    "endTime": None,
+                    "status": "active",
+                }
+                store["rows"] = [row]
+                return 201, json.dumps([row]).encode("utf-8")
+            if request.method == "PATCH" and "id=eq.5" in url:
+                body = json.loads(request.data.decode("utf-8"))
+                store["rows"][0].update(body)
+                return 200, json.dumps([store["rows"][0]]).encode("utf-8")
+            return 500, b""
+
+        settings = default_settings()
+        settings["server"]["read_url"] = "https://example.test"
+        settings["server"]["write_url"] = "https://example.test"
+        settings["server"]["base_url"] = "https://example.test"
+        settings["server"]["supabase_url"] = "https://db.test"
+        settings["server"]["supabase_key"] = "anon-key"
+        client = ApiClient(settings, transport=transport)
+        started = client.post_event(
+            {"badge": "adm001", "event": "in", "timestamp": "2026-10-14T09:15:04+06:00"}
+        )
+        self.assertTrue(started.ok)
+        self.assertEqual(gets["sessions"], 1)
+        finished = client.post_event(
+            {"badge": "adm001", "event": "out", "timestamp": "2026-10-14T18:05:00+06:00"}
+        )
+        self.assertTrue(finished.ok)
+        self.assertEqual(extract_event(finished.data), "out")
+        self.assertEqual(gets["sessions"], 1)
+        self.assertEqual(store["rows"][0]["status"], "completed")
+        self.assertEqual(store["rows"][0]["endTime"], "18:05:00")
+
+    def test_ordinary_rejection_does_not_skip_the_server(self) -> None:
+        hits = {"n": 0}
+
+        def transport(request, timeout, context):
+            del request, timeout, context
+            hits["n"] += 1
+            return 401, b'{"message":"no key"}'
+
+        settings = default_settings()
+        settings["server"]["read_url"] = "https://example.test"
+        settings["server"]["write_url"] = "https://example.test"
+        settings["server"]["base_url"] = "https://example.test"
+        client = ApiClient(settings, transport=transport)
+        client.get_employee("55001")
+        client.get_employee("55001")
+        self.assertEqual(hits["n"], 2)
+
     def test_admin_sign_in_authorizes_checkin_without_leaking_password(self) -> None:
         seen = []
 
@@ -530,7 +649,23 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(db.suppress_repeated_pending("77"), 2)
             self.assertEqual([row["event_type"] for row in db.pending_events() if row["badge"] == "77"], ["in", "out", "in"])
             self.assertFalse(db.has_older_pending("77", db.pending_events()[0]["id"]))
+            held = db.insert_event("88", "Иван", "in", moment, {"badge": "88", "event": "in"})
+            self.assertTrue(db.claim_event(held))
+            self.assertFalse(db.claim_event(held))
+            self.assertEqual(db.count_pending(), 4)
+            self.assertFalse(any(row["badge"] == "88" for row in db.pending_events()))
+            self.assertTrue(db.has_older_pending("88", held + 1))
+            duplicate = db.insert_event("88", "Иван", "in", moment, {"badge": "88", "event": "in"})
+            self.assertEqual(db.suppress_repeated_pending("88"), 1)
+            self.assertEqual(db.get_event(duplicate)["status"], "rejected")
+            self.assertEqual(db.get_event(held)["status"], "sending")
             db.close()
+            reopened = Database(Path(folder) / "t.db")
+            try:
+                self.assertEqual(reopened.get_event(held)["status"], "pending")
+                self.assertIn(held, [row["id"] for row in reopened.pending_events()])
+            finally:
+                reopened.close()
 
 
 class FakeUi:
@@ -800,6 +935,73 @@ class ServiceTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_screen_is_shown_before_the_server_answers(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, ui, speaker, api = self._service(folder, "http://server")
+            try:
+                api.employee = HttpResult(True, 200, {"name": "Иван", "active": True}, None, False)
+                api.status = HttpResult(True, 200, {"last_event": "out", "name": "Иван"}, None, False)
+                api.post = HttpResult(True, 200, {"ok": True, "event": "in", "name": "Иван"}, None, False)
+                event_id = service._process("10001", background=True)
+                self.assertEqual(ui.views[-1]["state"], "in")
+                self.assertEqual(ui.views[-1]["title"], "ПРИХОД")
+                self.assertEqual(ui.views[-1]["name"], "Иван")
+                self.assertIn("Приход", speaker.said[-1])
+                self.assertEqual(api.posts, [])
+                self.assertEqual(db.count_pending(), 1)
+                self.assertEqual(len(ui.views), 1)
+                service._send_saved(event_id)
+                self.assertEqual(db.count_pending(), 0)
+                self.assertEqual(len(ui.views), 1)
+                self.assertEqual(api.posts[0]["event"], "in")
+            finally:
+                db.close()
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_departure_follows_the_arrival_without_covering_the_screen(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, ui, _speaker, api = self._service(folder, "http://server")
+            try:
+                api.employee = HttpResult(True, 200, {"name": "Иван", "active": True}, None, False)
+                api.status = HttpResult(True, 200, {"last_event": "out", "name": "Иван"}, None, False)
+                api.post = HttpResult(True, 200, {"ok": True}, None, False)
+                arrival = service._process("10001", background=True)
+                service._process("10001", background=True)
+                self.assertEqual([view["title"] for view in ui.views], ["ПРИХОД", "УХОД"])
+                self.assertEqual(api.posts, [])
+                self.assertEqual([row["event_type"] for row in db.pending_events()], ["in", "out"])
+                departure = next(row["id"] for row in db.pending_events() if row["event_type"] == "out")
+                service._send_saved(arrival)
+                self.assertEqual([item["event"] for item in api.posts], ["in", "out"])
+                self.assertEqual(db.count_pending(), 0)
+                self.assertEqual(len(ui.views), 2)
+                self.assertEqual(db.get_event(departure)["status"], "sent")
+            finally:
+                db.close()
+
+    def test_next_person_is_not_waiting_on_the_server(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, ui, _speaker, api = self._service(folder, "http://server")
+            release = threading.Event()
+
+            def blocking(payload):
+                api.posts.append(dict(payload))
+                release.wait(3)
+                return HttpResult(True, 200, {"ok": True, "event": payload["event"]}, None, False)
+
+            api.post_event = blocking
+            try:
+                service.start()
+                service.submit_scan("11111")
+                service.submit_scan("22222")
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and len(ui.views) < 2:
+                    time.sleep(0.01)
+                self.assertEqual([view["state"] for view in ui.views], ["in", "in"])
+                self.assertEqual([view["title"] for view in ui.views], ["ПРИХОД", "ПРИХОД"])
+            finally:
+                release.set()
+                service.stop()
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and db.count_pending():
+                    time.sleep(0.01)
+                db.close()

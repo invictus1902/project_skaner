@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 import json
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -21,6 +23,8 @@ UNKNOWN_CODES = {
     "employee_not_found",
     "badge_not_found",
 }
+DIRECTORY_CACHE_SEC = 30.0
+CLOSED_HOST_SEC = 75.0
 
 
 @dataclass
@@ -223,9 +227,69 @@ class ApiClient:
         self._session_token = ""
         self._session_at = 0.0
         self._auth_error = ""
+        self._cache_lock = threading.Lock()
+        self._users_cache: tuple[float, list] | None = None
+        self._sessions_cache: tuple[float, list] | None = None
+        self._wall_until = 0.0
+        self._cached_server = self._server_key()
 
     def update(self, settings: dict) -> None:
+        """Новые настройки. Справочник сбрасывается только если сменился сервер."""
         self.settings = settings
+        identity = self._server_key()
+        with self._cache_lock:
+            if identity != self._cached_server:
+                self._cached_server = identity
+                self._users_cache = None
+                self._sessions_cache = None
+                self._wall_until = 0.0
+
+    def _server_key(self) -> tuple:
+        server = self.settings.get("server") or {}
+        return (
+            str(server.get("profile") or ""),
+            self.read_url(),
+            self.write_url(),
+            str(server.get("supabase_url") or "").strip(),
+            str(server.get("supabase_key") or "").strip(),
+        )
+
+    def _cache_get(self, kind: str) -> list | None:
+        with self._cache_lock:
+            slot = self._users_cache if kind == "users" else self._sessions_cache
+            if slot is None:
+                return None
+            saved_at, rows = slot
+            if time.monotonic() - saved_at > DIRECTORY_CACHE_SEC:
+                return None
+            return copy.deepcopy(rows)
+
+    def _cache_put(self, kind: str, rows: list, identity: tuple) -> None:
+        with self._cache_lock:
+            if identity != self._cached_server:
+                return
+            slot = (time.monotonic(), copy.deepcopy(rows))
+            if kind == "users":
+                self._users_cache = slot
+            else:
+                self._sessions_cache = slot
+
+    def _skip_express(self) -> bool:
+        """Хостинг уже ответил стеной Vercel: пока не стучаться в него на каждого человека."""
+        with self._cache_lock:
+            closed = time.monotonic() < self._wall_until
+        return closed and all(self._hosted_database())
+
+    def _note_wall(self, result: HttpResult) -> None:
+        # Обычный отказ без ключа — не стена. Иначе отметки перестанут ходить на рабочий сервер.
+        if not self._blocked(result):
+            return
+        with self._cache_lock:
+            self._wall_until = time.monotonic() + CLOSED_HOST_SEC
+
+    def _drop_sessions(self) -> None:
+        with self._cache_lock:
+            self._sessions_cache = None
 
     @property
     def is_site(self) -> bool:
@@ -246,6 +310,7 @@ class ApiClient:
         if self.is_site:
             users = self._directory_users()
             if isinstance(users.data, list) and not self._blocked(users):
+                self._directory_sessions()
                 return "online"
             return "offline"
         path = str((server.get("paths") or {}).get("health") or "").strip() or "/"
@@ -267,7 +332,7 @@ class ApiClient:
             if users.status is not None and users.status < 400:
                 return "Сервер ответил. Связь есть."
             return "Сервер не ответил. Проверьте адрес, сеть и путь проверки связи."
-        users, sessions = self.load_people()
+        users, sessions = self.load_people(refresh=True)
         if isinstance(users.data, list) and not self._blocked(users):
             people = [row for row in users.data if isinstance(row, dict)]
             with_badge = [row for row in people if str(row.get("badgeId") or "").strip()]
@@ -303,62 +368,137 @@ class ApiClient:
             return None
         return self._request("GET", url)
 
-    def load_people(self) -> tuple[HttpResult, HttpResult]:
+    def load_people(self, refresh: bool = False) -> tuple[HttpResult, HttpResult]:
         """Сотрудники и смены сайта. Пароли в ответ не входят.
 
         Сначала читает адрес получения данных. Если хостинг закрыт страницей Vercel,
         берёт тот же список из общей базы, которую показывает сайт.
+        Окно «Смены» передаёт refresh=True, чтобы не показать устаревший список.
         """
         empty = HttpResult(False, None, None, "Смены не загружены", True)
         if not self.is_site:
             return HttpResult(False, None, None, "Список сотрудников доступен в протоколе сайта учёта.", False), empty
-        users = self._directory_users()
+        users = self._directory_users(refresh=refresh)
         if not isinstance(users.data, list) or self._blocked(users):
             return users, empty
-        sessions = self._directory_sessions()
+        sessions = self._directory_sessions(refresh=refresh)
         if not isinstance(sessions.data, list) or self._blocked(sessions):
             sessions = HttpResult(True, users.status, [], None, False)
         return users, sessions
 
-    def _directory_users(self) -> HttpResult:
-        users = self._load_users()
-        if isinstance(users.data, list) and not users.network_error and not self._blocked(users):
-            return users
+    def _directory_users(self, refresh: bool = False) -> HttpResult:
+        if not refresh:
+            cached = self._cache_get("users")
+            if cached is not None:
+                return HttpResult(True, 200, cached, None, False)
+        identity = self._server_key()
+        users = None
+        if not self._skip_express():
+            users = self._load_users()
+            self._note_wall(users)
+            if isinstance(users.data, list) and not users.network_error and not self._blocked(users):
+                self._cache_put("users", users.data, identity)
+                return users
         hosted = self._supabase_get("users", "id,fullName,login,email,badgeId,role")
         if isinstance(hosted.data, list) and not self._blocked(hosted):
+            self._cache_put("users", hosted.data, identity)
             return hosted
-        return users
+        if users is not None:
+            return users
+        return HttpResult(False, None, None, "Список сотрудников недоступен", True)
 
-    def _directory_sessions(self) -> HttpResult:
-        sessions = self._request("GET", build_url(self.read_url(), "/workSessions"), send_auth=False)
-        if isinstance(sessions.data, list) and not self._blocked(sessions):
-            sessions.data = [_without_secrets(row) for row in sessions.data]
-            sessions.raw_text = ""
-            return sessions
+    def _directory_sessions(self, refresh: bool = False) -> HttpResult:
+        if not refresh:
+            cached = self._cache_get("sessions")
+            if cached is not None:
+                return HttpResult(True, 200, cached, None, False)
+        identity = self._server_key()
+        sessions = None
+        if not self._skip_express():
+            sessions = self._request("GET", build_url(self.read_url(), "/workSessions"), send_auth=False)
+            self._note_wall(sessions)
+            if isinstance(sessions.data, list) and not self._blocked(sessions):
+                sessions.data = [_without_secrets(row) for row in sessions.data]
+                sessions.raw_text = ""
+                self._cache_put("sessions", sessions.data, identity)
+                return sessions
         hosted = self._supabase_get(
             "workSessions",
             "id,userId,date,startTime,endTime,durationMinutes,status,source,editedBy",
             order="id.desc",
         )
         if isinstance(hosted.data, list) and not self._blocked(hosted):
+            self._cache_put("sessions", hosted.data, identity)
             return hosted
-        return sessions
+        if sessions is not None:
+            return sessions
+        return HttpResult(False, None, None, "Смены недоступны", True)
 
     def write_session(self, op: dict) -> HttpResult:
         """Создать или изменить смену. Если хостинг закрыт, пишет в ту же базу, что и сайт."""
         if not self.is_site:
             return HttpResult(False, None, None, "Запись смен работает в протоколе сайта учёта.", False)
-        express = self._express_write(op)
-        if express.ok and not self._blocked(express):
+        express = None
+        if not self._skip_express():
+            express = self._express_write(op)
+            self._note_wall(express)
+            if express.ok and not self._blocked(express):
+                self._remember_session(op, express.data)
+                return express
+            retry = express.network_error or self._blocked(express) or express.status in (401, 403, 408, 429) or (
+                express.status is not None and express.status >= 500
+            )
+            if not retry:
+                return express
+        hosted = self._supabase_write(op)
+        if hosted is not None:
+            if hosted.ok and not self._blocked(hosted):
+                self._remember_session(op, hosted.data)
+            return hosted
+        if express is not None:
             return express
-        retry = express.network_error or self._blocked(express) or express.status in (401, 403, 408, 429) or (
-            express.status is not None and express.status >= 500
-        )
-        if retry:
-            hosted = self._supabase_write(op)
-            if hosted is not None:
-                return hosted
-        return express
+        return HttpResult(False, None, None, "Общая база сайта не настроена", True)
+
+    def _remember_session(self, op: dict, data) -> None:
+        """Вписать только что сохранённую смену в память, не скачивая весь список заново."""
+        if not isinstance(data, dict):
+            return
+        payload = _json_object(op.get("payload"))
+        op_name = str(op.get("op") or "")
+        with self._cache_lock:
+            slot = self._sessions_cache
+            if slot is None:
+                return
+            rows = copy.deepcopy(slot[1])
+            if op_name == "create":
+                row = {key: value for key, value in payload.items() if str(key).lower() != "password"}
+                row.update({key: value for key, value in data.items() if str(key).lower() != "password"})
+                if not str(row.get("id") or "").strip():
+                    return
+                rows = [item for item in rows if str(item.get("id")) != str(row.get("id"))]
+                rows.append(row)
+            else:
+                session_id = str(data.get("id") or op.get("session_id") or "").strip()
+                if not session_id:
+                    return
+                found = False
+                updated = []
+                for item in rows:
+                    if str(item.get("id")) != session_id:
+                        updated.append(item)
+                        continue
+                    merged = dict(item)
+                    merged.update({key: value for key, value in payload.items() if str(key).lower() != "password"})
+                    merged.update({key: value for key, value in data.items() if str(key).lower() != "password"})
+                    updated.append(merged)
+                    found = True
+                if not found:
+                    row = {key: value for key, value in payload.items() if str(key).lower() != "password"}
+                    row.update({key: value for key, value in data.items() if str(key).lower() != "password"})
+                    row["id"] = session_id
+                    updated.append(row)
+                rows = updated
+            self._sessions_cache = (time.monotonic(), rows)
 
     def _express_write(self, op: dict) -> HttpResult:
         base = self.write_url()
@@ -493,8 +633,15 @@ class ApiClient:
         return fallback, result
 
     def _post_checkin(self, payload: dict) -> HttpResult:
+        if self._skip_express():
+            direct = self._write_checkin_shift(payload)
+            if direct is not None:
+                return direct
         express = self._express_checkin(payload)
+        self._note_wall(express)
         if express.ok and not self._blocked(express) and not _checkin_failed(express):
+            # Приём сканера сам переключил смену и не вернул строку. Список смен нужно прочитать заново.
+            self._drop_sessions()
             return express
         if _checkin_unknown(express):
             return express

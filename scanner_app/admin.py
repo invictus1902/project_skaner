@@ -23,9 +23,16 @@ from scanner_app.logging_setup import clear_log_files, logger, memory_handler
 from scanner_app.fonts import faces
 from scanner_app.logic import format_history_time, parse_iso
 from scanner_app.scanner import list_serial_ports, probe_serial_port
-from scanner_app.shifts_ui import ShiftsWindow
 from scanner_app.theme import THEME_LABELS, apply_ttk_style, theme_by_name
-from scanner_app.ui_helpers import Form, ScrollFrame
+from scanner_app.ui_helpers import (
+    Form,
+    ScrollFrame,
+    center_over,
+    ensure_independent,
+    place_window,
+    present_window,
+    widget_alive,
+)
 
 TEMPLATE_LABELS = (
     ("in", "Приход"),
@@ -171,10 +178,7 @@ class LoginDialog(tk.Toplevel):
         self.bind("<Return>", lambda _event: self._ok())
         self.bind("<Escape>", lambda _event: self.destroy())
         self.protocol("WM_DELETE_WINDOW", self.destroy)
-        self.update_idletasks()
-        x = master.winfo_rootx() + max(40, (master.winfo_width() - self.winfo_width()) // 2)
-        y = master.winfo_rooty() + 80
-        self.geometry(f"+{x}+{y}")
+        center_over(self, master)
         self.entry.focus_set()
         self.grab_set()
 
@@ -199,14 +203,8 @@ class AdminWindow(tk.Toplevel):
         super().__init__(master)
         self.app = app
         self.settings = app.settings
-        self.title("Настройки")
-        self.attributes("-topmost", True)
-        self.minsize(860, 560)
-        width = min(1080, master.winfo_screenwidth() - 48)
-        height = min(760, master.winfo_screenheight() - 100)
-        x = max(0, min(master.winfo_rootx() + 24, master.winfo_screenwidth() - width))
-        y = max(0, min(master.winfo_rooty() + 24, max(0, master.winfo_screenheight() - height - 48)))
-        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.title("Настройки · учёт времени")
+        place_window(self, 980, 680, min_width=760, min_height=520, align="right")
         _serif, _serif_bold, self.sans = faces(self)
         self._style_widgets()
         self._init_vars()
@@ -221,18 +219,11 @@ class AdminWindow(tk.Toplevel):
         self.bind_all("<MouseWheel>", self._wheel)
         self._refresh_staff()
         self.protocol("WM_DELETE_WINDOW", self._close)
+        ensure_independent(self)
+        present_window(self)
 
     def _open_shifts(self) -> None:
-        window = getattr(self, "_shifts_window", None)
-        if window is not None:
-            try:
-                if window.winfo_exists():
-                    window.lift()
-                    window.focus_force()
-                    return
-            except tk.TclError:
-                pass
-        self._shifts_window = ShiftsWindow(self, self.app)
+        self.app.open_shifts()
 
     def _style_widgets(self) -> None:
         theme = theme_by_name(self.settings["ui"].get("theme") or "dark")
@@ -316,21 +307,34 @@ class AdminWindow(tk.Toplevel):
         self._token_entry = None
 
     def _build(self) -> None:
+        theme = self._theme
+        head = tk.Frame(self, bg=theme["bg"])
+        head.pack(fill="x", padx=18, pady=(14, 2))
+        tk.Label(head, text="Настройки", bg=theme["bg"], fg=theme["text"], font=(self.sans, 20)).pack(anchor="w")
+        tk.Label(
+            head,
+            text="Это окно сворачивается отдельно: экран отметок остаётся на месте. F12 открывает настройки снова.",
+            bg=theme["bg"],
+            fg=theme["muted"],
+            font=(self.sans, 11),
+            wraplength=700,
+            justify="left",
+        ).pack(anchor="w", pady=(2, 0))
+        bar = ttk.Frame(self)
+        bar.pack(side="bottom", fill="x", padx=12, pady=(8, 12))
+        ttk.Label(bar, textvariable=self.status_text).pack(side="left")
+        ttk.Button(bar, text="Смены", command=self._open_shifts).pack(side="left", padx=(12, 0))
+        ttk.Button(bar, text="Закрыть", command=self._close).pack(side="right")
+        ttk.Button(bar, text="Сохранить", command=self._save, style="Accent.TButton").pack(side="right", padx=8)
+        tk.Frame(self, height=1, bg=self._theme["line"]).pack(side="bottom", fill="x", padx=12)
         self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
+        self.notebook.pack(fill="both", expand=True, padx=12, pady=(8, 4))
         self.notebook.add(self._server_tab(), text="Сервер")
         self.notebook.add(self._scanner_tab(), text="Сканер")
         self.notebook.add(self._voice_tab(), text="Голос")
         self.notebook.add(self._look_tab(), text="Экран")
         self.notebook.add(self._log_tab(), text="Журнал")
         self.notebook.add(self._tools_tab(), text="Обслуживание")
-        bar = ttk.Frame(self)
-        bar.pack(fill="x", padx=12, pady=(0, 10))
-        ttk.Label(bar, textvariable=self.status_text).pack(side="left")
-        ttk.Button(bar, text="Смены", command=self._open_shifts).pack(side="left", padx=(12, 0))
-        ttk.Button(bar, text="Закрыть", command=self._close).pack(side="right")
-        ttk.Button(bar, text="Сохранить", command=self._save, style="Accent.TButton").pack(side="right", padx=8)
-        bar.lift()
         self._load_profiles()
 
     def _scroll_form(self, title: str) -> tuple[ScrollFrame, Form]:
@@ -556,12 +560,21 @@ class AdminWindow(tk.Toplevel):
             self._token_entry.configure(show=hidden)
 
     def _wheel(self, event) -> None:
+        widget = getattr(event, "widget", None)
         try:
-            current = self.notebook.nametowidget(self.notebook.select())
+            if widget is None or widget.winfo_toplevel() is not self:
+                return
         except tk.TclError:
             return
-        if isinstance(current, ScrollFrame):
-            current.yview_scroll(int(-event.delta / 120))
+        target = widget
+        while target is not None:
+            if isinstance(target, (tk.Text, ttk.Treeview)):
+                return
+            if isinstance(target, ScrollFrame):
+                step = int(-event.delta / 120) or (-1 if event.delta < 0 else 1)
+                target.yview_scroll(step)
+                return "break"
+            target = getattr(target, "master", None)
 
     def collect(self) -> tuple[dict, list[str]]:
         import copy
@@ -894,19 +907,30 @@ class AdminWindow(tk.Toplevel):
         self.status_text.set("Код отправлен в обработку")
 
     def _on_debug(self, text: str) -> None:
-        self._append_box(self.debug_text, text)
+        self._append_box(getattr(self, "debug_text", None), text)
 
     def _on_result(self, view: dict) -> None:
+        label = getattr(self, "result_label", None)
+        if not widget_alive(label):
+            return
         name = view.get("name") or ""
         detail = view.get("detail") or ""
-        self.result_label.configure(text=f"{view.get('title', '')}: {name}. {detail}".strip())
+        try:
+            label.configure(text=f"{view.get('title', '')}: {name}. {detail}".strip())
+        except tk.TclError:
+            return
         self._refresh_queue()
 
     def _append_box(self, widget: scrolledtext.ScrolledText, text: str) -> None:
-        widget.configure(state="normal")
-        widget.insert("end", text + "\n")
-        widget.see("end")
-        widget.configure(state="disabled")
+        if not widget_alive(widget):
+            return
+        try:
+            widget.configure(state="normal")
+            widget.insert("end", text + "\n")
+            widget.see("end")
+            widget.configure(state="disabled")
+        except tk.TclError:
+            return
 
     def _add_employee(self) -> None:
         badge = self.emp_badge.get().strip()
@@ -929,9 +953,13 @@ class AdminWindow(tk.Toplevel):
         self._refresh_directory()
 
     def _refresh_directory(self) -> None:
+        if not widget_alive(getattr(self, "employee_tree", None)):
+            return
         self._fill_tree(self.employee_tree, [(row["badge"], row["name"]) for row in self.app.db.list_employees()])
 
     def _refresh_queue(self) -> None:
+        if not widget_alive(getattr(self, "queue_tree", None)):
+            return
         rows = []
         for row in self.app.db.pending_events(limit=30):
             moment = parse_iso(row["scanned_at"])
@@ -941,10 +969,16 @@ class AdminWindow(tk.Toplevel):
         self._fill_tree(self.queue_tree, rows)
 
     def _fill_tree(self, tree: ttk.Treeview, rows: list[tuple]) -> None:
-        for item in tree.get_children():
-            tree.delete(item)
-        for row in rows:
-            tree.insert("", "end", values=row)
+        if not widget_alive(tree):
+            return
+        try:
+            children = tree.get_children()
+            if children:
+                tree.delete(*children)
+            for row in rows:
+                tree.insert("", "end", values=row)
+        except tk.TclError:
+            return
 
     def _flush(self) -> None:
         self.app.service.flush_queue()
@@ -952,16 +986,21 @@ class AdminWindow(tk.Toplevel):
         self.after(1200, self._refresh_queue)
 
     def _refresh_log(self) -> None:
+        if not widget_alive(getattr(self, "log_text", None)):
+            return
         handler = memory_handler()
         lines = []
         if handler is not None:
             level = logging.ERROR if self.only_errors.get() else logging.INFO
             lines = handler.snapshot(level)
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.insert("1.0", "\n".join(lines) if lines else "Журнал пуст")
-        self.log_text.configure(state="disabled")
-        self.log_text.see("end")
+        try:
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", "end")
+            self.log_text.insert("1.0", "\n".join(lines) if lines else "Журнал пуст")
+            self.log_text.configure(state="disabled")
+            self.log_text.see("end")
+        except tk.TclError:
+            return
 
     def _open_logs(self) -> None:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1005,5 +1044,10 @@ class AdminWindow(tk.Toplevel):
             self.unbind_all("<MouseWheel>")
         except tk.TclError:
             pass
+        app = self.app
         self.destroy()
-        self.app._admin = None
+        app._admin = None
+        try:
+            app._apply_window_mode()
+        except tk.TclError:
+            pass

@@ -6,6 +6,10 @@ import threading
 from scanner_app.logging_setup import logger
 
 
+# SAPI: говорить сразу и оборвать предыдущую фразу, чтобы очередь людей не копилась в голосе.
+_SPEAK_NOW = 1 | 2
+
+
 class Speaker:
     """Озвучка через голос Windows (SAPI). Работает без интернета."""
 
@@ -26,7 +30,21 @@ class Speaker:
         cleaned = " ".join(str(text or "").split())
         if not cleaned:
             return
+        self._drop_waiting()
         self._queue.put((cleaned[:400], dict(options or {})))
+
+    def _drop_waiting(self) -> None:
+        """Новая отметка заменяет ещё не сказанные. Команду остановки не теряем."""
+        stop = False
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                stop = True
+        if stop:
+            self._queue.put(None)
 
     def list_voices(self, timeout: float = 8) -> list[dict[str, str]]:
         self._ready.wait(timeout)
@@ -58,7 +76,10 @@ class Speaker:
             text, options = item
             try:
                 self._apply(options)
-                self._voice.Speak(text)
+                try:
+                    self._voice.Speak(text, _SPEAK_NOW)
+                except Exception:
+                    self._voice.Speak(text)
             except Exception:
                 logger().exception("Не удалось произнести фразу")
 

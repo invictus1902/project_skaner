@@ -61,6 +61,7 @@ class AttendanceService:
         self._cooldown: dict[str, float] = {}
         self._cooldown_lock = threading.Lock()
         self._io_lock = threading.Lock()
+        self._send_slots = threading.Semaphore(4)
 
     def start(self) -> None:
         self._stop.clear()
@@ -105,8 +106,11 @@ class AttendanceService:
                 manual = raw[0] == "manual"
                 raw = raw[1] if len(raw) > 1 else ""
             try:
+                event_id = None
                 with self._io_lock:
-                    self._process(str(raw), manual=manual)
+                    event_id = self._process(str(raw), manual=manual, background=True)
+                if event_id:
+                    self._send_later(int(event_id))
             except Exception:
                 logger().exception("Ошибка обработки кода")
                 self.ui.show(
@@ -131,7 +135,7 @@ class AttendanceService:
             if self._stop.wait(max(5, delay)):
                 return
 
-    def _process(self, raw: str, manual: bool = False) -> None:
+    def _process(self, raw: str, manual: bool = False, background: bool = False) -> int | None:
         settings = copy.deepcopy(self.settings)
         scanner = settings.get("scanner") or {}
         badge = manual_badge(raw, scanner) if manual else normalize_badge(raw, scanner)
@@ -180,17 +184,6 @@ class AttendanceService:
 
         cached = self.db.get_employee(badge)
         cached_name = (cached or {}).get("name") or ""
-        self.ui.show(
-            self._view(
-                state="progress",
-                title="СЧИТЫВАНИЕ",
-                name=cached_name or badge,
-                when="",
-                detail="Проверяем бейдж…",
-                badge=badge,
-            )
-        )
-
         action, employee_name = self._lookup_employee(badge, cached_name, settings)
         if action == "unknown":
             self._reject_visible(settings, badge, badge, "unknown", "БЕЙДЖ НЕ НАЙДЕН", "Такого бейджа нет в справочнике.", "unknown")
@@ -228,16 +221,30 @@ class AttendanceService:
         when = format_when(now)
         if not server_configured(settings.get("server")):
             self._finish_local(settings, screen_name, speech_name, badge, event, when, spoken, "Сервер не настроен. Запись сохранена на этом компьютере.")
-            return
+            return None
         # Сайт не смотрит тип отметки, а переключает открытую смену.
         # Нельзя отправить уход, пока предыдущий приход ещё лежит в очереди.
         if self.db.has_older_pending(badge, event_id):
             message = "Отметка сохранена. Она уйдёт на сервер сразу после предыдущей."
             self.db.mark_retry(event_id, message)
+            if background:
+                self._announce_choice(settings, screen_name, speech_name, badge, event, when, spoken)
+                return None
             self._finish_local(settings, screen_name, speech_name, badge, event, when, spoken, message)
-            return
+            return None
 
-        result = self.api.post_event(payload)
+        if background:
+            # Экран и голос не ждут сеть: следующий человек отмечается сразу.
+            self._announce_choice(settings, screen_name, speech_name, badge, event, when, spoken)
+            return event_id
+
+        if not self.db.claim_event(event_id):
+            return None
+        try:
+            result = self.api.post_event(payload)
+        except Exception:
+            self.db.mark_retry(event_id, "Сбой отправки")
+            raise
         kind, message = classify_post(result)
         self._apply_server_result(
             settings,
@@ -252,6 +259,7 @@ class AttendanceService:
             kind,
             message,
         )
+        return None
 
     def _lookup_employee(self, badge: str, cached_name: str, settings: dict) -> tuple[str, str]:
         result = self.api.get_employee(badge)
@@ -306,7 +314,7 @@ class AttendanceService:
         if last_time is not None and last_time.tzinfo is None:
             last_time = last_time.replace(tzinfo=now.tzinfo)
         max_hours = float(settings.get("attendance", {}).get("shift_max_hours") or 16)
-        if last and last.get("status") == "pending":
+        if last and last.get("status") in ("pending", "sending"):
             event = decide_event(last_event, last_time, now, max_hours)
             abandoned = last_event == "in" and event == "in"
             return event, abandoned, name
@@ -333,6 +341,7 @@ class AttendanceService:
         result,
         kind,
         message,
+        announce: bool = True,
     ) -> None:
         data = result.data if isinstance(result.data, dict) else {}
         if kind == "sent":
@@ -348,24 +357,30 @@ class AttendanceService:
             elif message == "Уже зарегистрировано":
                 detail = "Уже зарегистрировано на сервере"
             logger().info("Скан %s → %s, %s, отправлено", badge, final_event, final_name)
-            self._present(
-                settings,
-                state=final_event,
-                title=title,
-                name=final_name,
-                when=when,
-                detail=detail,
-                badge=badge,
-                template=final_event,
-                beep_kind="ok",
-                event=final_event,
-                speech_name=final_name if final_name != badge else speech_name,
-                spoken=spoken,
-            )
+            if announce:
+                self._present(
+                    settings,
+                    state=final_event,
+                    title=title,
+                    name=final_name,
+                    when=when,
+                    detail=detail,
+                    badge=badge,
+                    template=final_event,
+                    beep_kind="ok",
+                    event=final_event,
+                    speech_name=final_name if final_name != badge else speech_name,
+                    spoken=spoken,
+                )
+            else:
+                self._touch_ui()
             return
         if kind == "unknown":
             self.db.mark_rejected(event_id, message)
             logger().info("Скан %s → бейдж не найден", badge)
+            if not announce:
+                self._touch_ui()
+                return
             self._present(
                 settings,
                 state="unknown",
@@ -383,6 +398,9 @@ class AttendanceService:
         if kind == "rejected":
             self.db.mark_rejected(event_id, message)
             logger().warning("Скан %s отклонён: %s", badge, message)
+            if not announce:
+                self._touch_ui()
+                return
             self._present(
                 settings,
                 state="error",
@@ -399,7 +417,107 @@ class AttendanceService:
             return
         self.db.mark_retry(event_id, message)
         logger().warning("Скан %s сохранён в очередь: %s", badge, message)
+        if not announce:
+            self._touch_ui()
+            return
         self._finish_local(settings, screen_name, speech_name, badge, event, when, spoken, "Нет связи с сервером. Запись будет отправлена позже.")
+
+    def _announce_choice(self, settings, screen_name, speech_name, badge, event, when, spoken) -> None:
+        if event == "in":
+            title = "ПРИХОД"
+        elif event == "out":
+            title = "УХОД"
+        else:
+            title = "СОХРАНЕНО"
+        state = event if event in ("in", "out") else "offline"
+        logger().info("Скан %s → %s, %s, на экране", badge, event, screen_name)
+        self._present(
+            settings,
+            state=state,
+            title=title,
+            name=screen_name,
+            when=when,
+            detail="Отмечено",
+            badge=badge,
+            template=state if state in ("in", "out") else "offline",
+            beep_kind="ok",
+            event=event or "in",
+            speech_name=speech_name,
+            spoken=spoken,
+        )
+
+    def _touch_ui(self) -> None:
+        self.ui.refresh_history()
+        self.ui.set_pending(self.db.count_pending())
+
+    def _send_later(self, event_id: int) -> None:
+        def run() -> None:
+            with self._send_slots:
+                self._send_saved(event_id)
+
+        threading.Thread(target=run, name="send", daemon=True).start()
+
+    def _send_saved(self, event_id: int) -> str:
+        """Отправить уже показанную отметку. Большой экран при этом не меняется."""
+        try:
+            kind = self._deliver(event_id)
+        except Exception:
+            logger().exception("Ошибка отправки отметки")
+            try:
+                row = self.db.get_event(event_id)
+                if row and row.get("status") in ("pending", "sending"):
+                    self.db.mark_retry(event_id, "Сбой отправки")
+            except Exception:
+                logger().exception("Не удалось вернуть отметку в очередь")
+            self._touch_ui()
+            return "retry"
+        if kind in ("skip", "retry"):
+            return kind
+        row = self.db.get_event(event_id)
+        if row is None:
+            return kind
+        nxt = self.db.next_pending_id(str(row["badge"]))
+        if nxt and nxt != event_id:
+            return self._send_saved(nxt)
+        return kind
+
+    def _deliver(self, event_id: int) -> str:
+        row = self.db.get_event(event_id)
+        if row is None or row.get("status") != "pending":
+            return "skip"
+        badge = str(row["badge"])
+        if self.db.has_older_pending(badge, event_id):
+            return "skip"
+        if not self.db.claim_event(event_id):
+            return "skip"
+        try:
+            payload = json.loads(row.get("payload") or "{}")
+        except json.JSONDecodeError:
+            payload = {
+                "badge": badge,
+                "event": row["event_type"],
+                "timestamp": row["scanned_at"],
+                "device_id": (self.settings.get("server") or {}).get("device_id") or "",
+                "name": row.get("name") or "",
+            }
+        result = self.api.post_event(payload)
+        kind, message = classify_post(result)
+        moment = parse_iso(str(row.get("scanned_at") or "")) or datetime.now().astimezone()
+        self._apply_server_result(
+            copy.deepcopy(self.settings),
+            event_id,
+            badge,
+            str(row.get("event_type") or ""),
+            row.get("name") or badge,
+            row.get("name") or badge,
+            format_when(moment),
+            "",
+            result,
+            kind,
+            message,
+            announce=False,
+        )
+        return kind
 
     def _finish_local(self, settings, screen_name, speech_name, badge, event, when, spoken, detail) -> None:
         if event == "in":
@@ -492,8 +610,7 @@ class AttendanceService:
         }
 
     def _flush_once(self) -> None:
-        with self._io_lock:
-            self._flush_pending()
+        self._flush_pending()
 
     def _flush_pending(self) -> None:
         settings = copy.deepcopy(self.settings)
@@ -510,32 +627,10 @@ class AttendanceService:
         for row in self.db.pending_events(limit=20):
             if self._stop.is_set():
                 return
-            try:
-                payload = json.loads(row.get("payload") or "{}")
-            except json.JSONDecodeError:
-                payload = {
-                    "badge": row["badge"],
-                    "event": row["event_type"],
-                    "timestamp": row["scanned_at"],
-                    "device_id": settings.get("server", {}).get("device_id") or "",
-                    "name": row.get("name") or "",
-                }
-            result = self.api.post_event(payload)
-            kind, message = classify_post(result)
-            if kind == "sent":
-                data = result.data if isinstance(result.data, dict) else {}
-                final_event = extract_event(data) or row["event_type"]
-                final_name = extract_name(data) or row.get("name") or ""
-                self.db.mark_sent(row["id"], final_name or row.get("name") or row["badge"], final_event)
-                if final_name:
-                    self.db.upsert_employee(row["badge"], final_name, "server")
-                logger().info("Очередь: %s %s отправлено", row["badge"], final_event)
-            elif kind in ("unknown", "rejected"):
-                self.db.mark_rejected(row["id"], message)
-                logger().warning("Очередь: %s отклонено: %s", row["badge"], message)
-            else:
-                self.db.mark_retry(row["id"], message)
-                logger().warning("Очередь: %s ждёт связи: %s", row["badge"], message)
+            if self.db.has_older_pending(row["badge"], int(row["id"])):
+                continue
+            kind = self._send_saved(int(row["id"]))
+            if kind == "retry":
                 break
         self.ui.set_pending(self.db.count_pending())
         self.ui.refresh_history()
@@ -547,7 +642,7 @@ class AttendanceService:
             logger().exception("Ошибка очереди смен")
 
     def run_shift(self, callback):
-        """Правка смены под тем же замком, что и отправка сканов."""
+        """Правка смены под тем же замком, что и решение «приход или уход»."""
         with self._io_lock:
             self.api.update(copy.deepcopy(self.settings))
             from scanner_app.shifts import ShiftBook

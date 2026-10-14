@@ -20,6 +20,7 @@ from scanner_app.shifts import (
     sessions_for_user,
 )
 from scanner_app.theme import apply_ttk_style, theme_by_name
+from scanner_app.ui_helpers import center_over, ensure_independent, place_window, present_window
 
 
 class ShiftsWindow(tk.Toplevel):
@@ -28,13 +29,8 @@ class ShiftsWindow(tk.Toplevel):
     def __init__(self, master, app) -> None:
         super().__init__(master)
         self.app = app
-        self.title("Смены")
-        self.minsize(920, 560)
-        width = min(1180, master.winfo_screenwidth() - 80)
-        height = min(760, master.winfo_screenheight() - 100)
-        x = max(0, min(master.winfo_rootx() + 36, master.winfo_screenwidth() - width))
-        y = max(0, min(master.winfo_rooty() + 36, max(0, master.winfo_screenheight() - height - 48)))
-        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.title("Смены · учёт времени")
+        place_window(self, 1040, 660, min_width=760, min_height=520, align="right", dy=40)
         self._theme = theme_by_name((app.settings.get("ui") or {}).get("theme") or "dark")
         _serif, _bold, self.sans = faces(self)
         self._users: list[dict] = []
@@ -50,7 +46,13 @@ class ShiftsWindow(tk.Toplevel):
         self._build()
         self._query.trace_add("write", lambda *_args: self._fill_people())
         self._filter.trace_add("write", lambda *_args: self._fill_people())
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda _event: self._close())
+        self.bind("<Destroy>", self._forget, add="+")
+        self.people.bind("<Configure>", self._fit_people, add="+")
+        self.sessions.bind("<Configure>", self._fit_sessions, add="+")
+        ensure_independent(self)
+        present_window(self)
         self._reload()
 
     def _style(self) -> None:
@@ -62,12 +64,18 @@ class ShiftsWindow(tk.Toplevel):
         top = ttk.Frame(self)
         top.pack(fill="x", padx=20, pady=(16, 4))
         ttk.Label(top, text="Смены", font=(self.sans, 22)).pack(anchor="w")
-        ttk.Label(top, textvariable=self._status, wraplength=980, justify="left").pack(anchor="w", pady=(4, 0))
+        ttk.Label(
+            top,
+            text="Окно сворачивается отдельно от остальных. Esc — закрыть.",
+            wraplength=700,
+            justify="left",
+        ).pack(anchor="w", pady=(2, 0))
+        ttk.Label(top, textvariable=self._status, wraplength=700, justify="left").pack(anchor="w", pady=(4, 0))
 
         search = ttk.Frame(self)
         search.pack(fill="x", padx=20, pady=(10, 4))
         ttk.Label(search, text="Найти").pack(side="left")
-        ttk.Entry(search, textvariable=self._query).pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Entry(search, textvariable=self._query).pack(side="left", fill="x", expand=True, padx=8, ipady=3)
         ttk.Button(search, text="Обновить", command=self._reload).pack(side="left")
         ttk.Button(search, text="Отправить очередь", command=self._flush).pack(side="left", padx=(8, 0))
 
@@ -114,6 +122,12 @@ class ShiftsWindow(tk.Toplevel):
         ttk.Button(actions, text="Начать смену", command=self._start, style="Accent.TButton").pack(side="left")
         ttk.Button(actions, text="Завершить смену", command=self._finish).pack(side="left", padx=8)
         ttk.Button(actions, text="Изменить смену", command=self._edit).pack(side="left")
+        ttk.Label(
+            right,
+            text="Двойной щелчок меняет смену. У идущей — только приход, у завершённой — приход и уход.",
+            wraplength=420,
+            justify="left",
+        ).pack(side="bottom", anchor="w", pady=(8, 0))
         self.sessions = ttk.Treeview(right, columns=("date", "start", "end", "length", "state"), show="headings", height=12)
         for column, title, width in (
             ("date", "Дата", 110),
@@ -129,12 +143,6 @@ class ShiftsWindow(tk.Toplevel):
         self.sessions.tag_configure("closed", foreground=self._theme["text"])
         self.sessions.tag_configure("pending", foreground=self._theme["warn_text"])
         self.sessions.bind("<Double-1>", lambda _event: self._edit())
-        ttk.Label(
-            right,
-            text="Двойной щелчок меняет смену. У идущей — только приход, у завершённой — приход и уход.",
-            wraplength=560,
-            justify="left",
-        ).pack(anchor="w", pady=(8, 0))
 
     def _reload(self) -> None:
         self._status.set("Загружаю сотрудников и смены…")
@@ -160,6 +168,11 @@ class ShiftsWindow(tk.Toplevel):
         threading.Thread(target=run, daemon=True).start()
 
     def _apply(self, snapshot: dict, prefix: str = "") -> None:
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
         self._users = list(snapshot.get("users") or [])
         self._sessions = list(snapshot.get("sessions") or [])
         counts = {STATE_AT_WORK: 0, STATE_AWAY: 0, STATE_NEVER: 0}
@@ -402,6 +415,32 @@ class ShiftsWindow(tk.Toplevel):
                 highlightcolor=theme["button"] if selected else theme["line"],
             )
 
+    def _close(self) -> None:
+        app = self.app
+        if getattr(app, "_shifts", None) is self:
+            app._shifts = None
+        self.destroy()
+        try:
+            app._apply_window_mode()
+        except tk.TclError:
+            pass
+
+    def _forget(self, event) -> None:
+        if event.widget is not self:
+            return
+        if getattr(self.app, "_shifts", None) is self:
+            self.app._shifts = None
+
+    def _fit_people(self, event) -> None:
+        if event.widget is not self.people or event.width < 200:
+            return
+        self.people.column("name", width=max(160, event.width - 300))
+
+    def _fit_sessions(self, event) -> None:
+        if event.widget is not self.sessions or event.width < 200:
+            return
+        self.sessions.column("state", width=max(140, event.width - 400))
+
     def _post(self, callback) -> None:
         try:
             self.after(0, callback)
@@ -459,13 +498,21 @@ def _ask_times(master, title: str, mode: str, initial: dict, theme: dict) -> dic
     buttons = ttk.Frame(dialog)
     buttons.pack(fill="x", padx=18, pady=16)
 
-    def accept() -> None:
+    def accept(_event=None) -> str:
         result.clear()
         result.update({key: variable.get().strip() for key, variable in fields.items()})
         dialog.destroy()
+        return "break"
+
+    def cancel(_event=None) -> str:
+        dialog.destroy()
+        return "break"
 
     ttk.Button(buttons, text="Сохранить", command=accept, style="Accent.TButton").pack(side="right")
-    ttk.Button(buttons, text="Отмена", command=dialog.destroy).pack(side="right", padx=8)
+    ttk.Button(buttons, text="Отмена", command=cancel).pack(side="right", padx=8)
+    dialog.bind("<Return>", accept)
+    dialog.bind("<Escape>", cancel)
+    center_over(dialog, master)
     dialog.grab_set()
     dialog.wait_window()
     return result or None
