@@ -6,7 +6,7 @@ import os
 import queue
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from scanner_app.api import classify_post, extract_active, extract_event, extract_name
 from scanner_app.config import server_configured
@@ -180,7 +180,6 @@ class AttendanceService:
                     speech_name=(cached or {}).get("name") or f"Бейдж {badge}",
                 )
                 return
-            self._cooldown[badge] = now_mono
 
         cached = self.db.get_employee(badge)
         cached_name = (cached or {}).get("name") or ""
@@ -218,6 +217,8 @@ class AttendanceService:
             "name": employee_name,
         }
         event_id = self.db.insert_event(badge, screen_name, event, now, payload)
+        with self._cooldown_lock:
+            self._cooldown[badge] = time.monotonic()
         when = format_when(now)
         if not server_configured(settings.get("server")):
             self._finish_local(settings, screen_name, speech_name, badge, event, when, spoken, "Сервер не настроен. Запись сохранена на этом компьютере.")
@@ -267,8 +268,10 @@ class AttendanceService:
             return "skip", cached_name
         data = result.data if isinstance(result.data, dict) else {}
         err_code = str(data.get("error") or data.get("code") or "").lower()
-        missing = result.status == 404 or err_code in UNKNOWN_CODES
-        if missing:
+        # Явный ответ «бейджа нет» — это не обрыв связи. Иначе экран говорит «приход».
+        if err_code in UNKNOWN_CODES:
+            return "unknown", ""
+        if result.status == 404:
             if settings.get("server", {}).get("strict_employee_check"):
                 return "unknown", ""
             return "skip", cached_name
@@ -313,12 +316,19 @@ class AttendanceService:
         last_time = parse_iso(last["scanned_at"]) if last else None
         if last_time is not None and last_time.tzinfo is None:
             last_time = last_time.replace(tzinfo=now.tzinfo)
+        server_started = None
+        if status is not None and isinstance(getattr(status, "data", None), dict):
+            server_started = parse_iso(str(status.data.get("last_time") or ""))
+        if server_started is not None and server_started.tzinfo is None:
+            server_started = server_started.replace(tzinfo=now.tzinfo)
         max_hours = float(settings.get("attendance", {}).get("shift_max_hours") or 16)
         if last and last.get("status") in ("pending", "sending"):
             event = decide_event(last_event, last_time, now, max_hours)
             abandoned = last_event == "in" and event == "in"
             return event, abandoned, name
         if server_event == "in":
+            if server_started is not None and now - server_started > timedelta(hours=max_hours):
+                return "in", True, name
             return "out", False, name
         if server_event == "out":
             return "in", False, name
@@ -471,7 +481,7 @@ class AttendanceService:
                 logger().exception("Не удалось вернуть отметку в очередь")
             self._touch_ui()
             return "retry"
-        if kind in ("skip", "retry"):
+        if kind in ("skip", "retry", "wait"):
             return kind
         row = self.db.get_event(event_id)
         if row is None:
@@ -517,6 +527,9 @@ class AttendanceService:
             message,
             announce=False,
         )
+        # Смена этого человека ещё не видна. Остальных в очереди это не держит.
+        if kind == "retry" and "ещё не появилась" in str(message or ""):
+            return "wait"
         return kind
 
     def _finish_local(self, settings, screen_name, speech_name, badge, event, when, spoken, detail) -> None:

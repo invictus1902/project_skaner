@@ -8,13 +8,13 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
 
 from scanner_app.config import LOCAL_API_URL, server_urls
 from scanner_app.logging_setup import logger
 from scanner_app.logic import parse_iso
-from scanner_app.shifts import duration_minutes, is_open
+from scanner_app.shifts import duration_minutes, is_open, normalize_clock, normalize_date
 
 UNKNOWN_CODES = {
     "unknown_badge",
@@ -153,16 +153,19 @@ def _json_object(value) -> dict:
     return {}
 
 
-def _shift_open(row: dict) -> bool:
-    return is_open(row)
-
-
 def _event_moment(value) -> datetime:
     """Время самой отметки, а не время, когда очередь дошла до сервера."""
     parsed = parse_iso(str(value or ""))
     if parsed is None:
         return datetime.now().astimezone()
     return parsed
+
+
+def _session_rank(row: dict) -> tuple:
+    text = str(row.get("id") or "")
+    if text.isdigit():
+        return (1, int(text))
+    return (0, 0)
 
 
 def _open_session(sessions: list, user_id) -> dict | None:
@@ -174,26 +177,77 @@ def _open_session(sessions: list, user_id) -> dict | None:
     ]
     if not rows:
         return None
-
-    def sort_key(row: dict) -> tuple:
-        text = str(row.get("id") or "")
-        if text.isdigit():
-            return (1, int(text))
-        return (0, 0)
-
-    rows.sort(key=sort_key)
+    rows.sort(key=_session_rank)
     return rows[-1]
 
 
-def _checkin_result(name: str, event: str) -> HttpResult:
-    action = "start" if event == "in" else "end"
-    return HttpResult(
-        True,
-        200,
-        {"success": True, "action": action, "event": event, "fullName": name, "name": name},
-        None,
-        False,
-    )
+def _badge_indexes(rows: list) -> tuple[dict, dict]:
+    """Точный код и код без регистра. При повторе точный берётся первый, прочие — последний."""
+    exact: dict = {}
+    folded: dict = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        current = str(row.get("badgeId") or "").strip()
+        if not current:
+            continue
+        exact.setdefault(current, row)
+        folded[current.casefold()] = row
+    return exact, folded
+
+
+def _open_index(rows: list) -> dict:
+    """Открытая смена с наибольшим номером для каждого сотрудника."""
+    best: dict = {}
+    rank: dict = {}
+    for row in rows:
+        if not isinstance(row, dict) or not is_open(row):
+            continue
+        key = str(row.get("userId"))
+        score = _session_rank(row)
+        previous = rank.get(key)
+        if previous is None or score >= previous:
+            rank[key] = score
+            best[key] = row
+    return best
+
+
+def _session_started(session: dict, moment: datetime) -> datetime | None:
+    """Начало смены в той же зоне, что и отметка. В базе лежит местное время без пояса."""
+    day = normalize_date(str(session.get("date") or ""))
+    clock = normalize_clock(str(session.get("startTime") or ""))
+    if not day or not clock:
+        return None
+    try:
+        parsed = datetime.strptime(day + "T" + clock, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    if moment.tzinfo is not None:
+        return parsed.replace(tzinfo=moment.tzinfo)
+    return parsed
+
+
+def _shift_is_stale(session: dict, moment: datetime, max_hours: float) -> bool:
+    """Смена открыта дольше окна: это уже не текущий рабочий день."""
+    started = _session_started(session, moment)
+    if started is None:
+        return False
+    return moment - started > timedelta(hours=float(max_hours))
+
+
+def _merge_by_id(primary: list, extra: list) -> list:
+    merged = []
+    seen = set()
+    for row in list(primary) + list(extra):
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("id") or "")
+        if key:
+            if key in seen:
+                continue
+            seen.add(key)
+        merged.append(row)
+    return merged
 
 
 def _checkin_unknown(result: HttpResult) -> bool:
@@ -228,8 +282,8 @@ class ApiClient:
         self._session_at = 0.0
         self._auth_error = ""
         self._cache_lock = threading.Lock()
-        self._users_cache: tuple[float, list] | None = None
-        self._sessions_cache: tuple[float, list] | None = None
+        self._users_cache: tuple | None = None
+        self._sessions_cache: tuple | None = None
         self._wall_until = 0.0
         self._cached_server = self._server_key()
 
@@ -259,20 +313,20 @@ class ApiClient:
             slot = self._users_cache if kind == "users" else self._sessions_cache
             if slot is None:
                 return None
-            saved_at, rows = slot
+            saved_at = slot[0]
             if time.monotonic() - saved_at > DIRECTORY_CACHE_SEC:
                 return None
-            return copy.deepcopy(rows)
+            return copy.deepcopy(slot[1])
 
     def _cache_put(self, kind: str, rows: list, identity: tuple) -> None:
         with self._cache_lock:
             if identity != self._cached_server:
                 return
-            slot = (time.monotonic(), copy.deepcopy(rows))
+            stored = copy.deepcopy(rows)
             if kind == "users":
-                self._users_cache = slot
+                self._users_cache = (time.monotonic(), stored, _badge_indexes(stored))
             else:
-                self._sessions_cache = slot
+                self._sessions_cache = (time.monotonic(), stored, _open_index(stored))
 
     def _skip_express(self) -> bool:
         """Хостинг уже ответил стеной Vercel: пока не стучаться в него на каждого человека."""
@@ -286,6 +340,13 @@ class ApiClient:
             return
         with self._cache_lock:
             self._wall_until = time.monotonic() + CLOSED_HOST_SEC
+
+    def _cache_alive(self, kind: str) -> bool:
+        with self._cache_lock:
+            slot = self._users_cache if kind == "users" else self._sessions_cache
+            if slot is None:
+                return False
+            return time.monotonic() - slot[0] <= DIRECTORY_CACHE_SEC
 
     def _drop_sessions(self) -> None:
         with self._cache_lock:
@@ -308,11 +369,14 @@ class ApiClient:
         if not base and not (self.is_site and self._hosted_database()[0]):
             return "unset"
         if self.is_site:
-            users = self._directory_users()
-            if isinstance(users.data, list) and not self._blocked(users):
+            # Пока списки свежие, проверка связи не копирует их и не ходит в сеть.
+            if not self._cache_alive("users"):
+                users = self._directory_users()
+                if not isinstance(users.data, list) or self._blocked(users):
+                    return "offline"
+            if not self._cache_alive("sessions"):
                 self._directory_sessions()
-                return "online"
-            return "offline"
+            return "online"
         path = str((server.get("paths") or {}).get("health") or "").strip() or "/"
         result = self._request("GET", build_url(base, path))
         if result.network_error or result.status is None or result.status >= 400 or self._blocked(result):
@@ -428,6 +492,16 @@ class ApiClient:
             order="id.desc",
         )
         if isinstance(hosted.data, list) and not self._blocked(hosted):
+            # У базы потолок 1000 строк. Старая открытая смена иначе выпадает
+            # из последних записей, и следующий скан открывает вторую.
+            if len(hosted.data) >= 1000:
+                opened = self._supabase_get(
+                    "workSessions",
+                    "id,userId,date,startTime,endTime,durationMinutes,status,source,editedBy",
+                    extra_query="or=(status.eq.active,endTime.is.null)",
+                )
+                if isinstance(opened.data, list) and not self._blocked(opened):
+                    hosted.data = _merge_by_id(hosted.data, opened.data)
             self._cache_put("sessions", hosted.data, identity)
             return hosted
         if sessions is not None:
@@ -498,7 +572,7 @@ class ApiClient:
                     row["id"] = session_id
                     updated.append(row)
                 rows = updated
-            self._sessions_cache = (time.monotonic(), rows)
+            self._sessions_cache = (time.monotonic(), rows, _open_index(rows))
 
     def _express_write(self, op: dict) -> HttpResult:
         base = self.write_url()
@@ -533,13 +607,15 @@ class ApiClient:
         current = str(found.get("badgeId") or "").strip()
         return current or text
 
-    def _supabase_get(self, table: str, select: str, order: str = "") -> HttpResult:
+    def _supabase_get(self, table: str, select: str, order: str = "", extra_query: str = "") -> HttpResult:
         base, key = self._hosted_database()
         if not base or not key:
             return HttpResult(False, None, None, "Общая база сайта не настроена", True)
         url = base + "/rest/v1/" + table + "?select=" + quote(select, safe=",") + "&limit=1000"
         if order:
             url += "&order=" + quote(order, safe=".")
+        if extra_query:
+            url += "&" + extra_query
         result = self._request("GET", url, send_auth=False, extra_headers=self._supabase_headers())
         if isinstance(result.data, list):
             result.data = [_without_secrets(row) for row in result.data]
@@ -569,7 +645,17 @@ class ApiClient:
                 extra_headers=headers,
             )
         if isinstance(result.data, list):
-            first = result.data[0] if result.data and isinstance(result.data[0], dict) else {}
+            if not result.data:
+                # Пустой список при return=representation — строка не записана.
+                # Код 2xx иначе выглядит как успех, и смена остаётся открытой.
+                result.ok = False
+                if result.status is not None and 200 <= result.status < 300:
+                    result.status = 422
+                result.error = "Сервер не вернул строку смены"
+                result.data = {"message": result.error}
+                result.raw_text = ""
+                return result
+            first = result.data[0] if isinstance(result.data[0], dict) else {}
             result.data = _without_secrets(first) if first else {}
             result.raw_text = ""
         return result
@@ -607,20 +693,35 @@ class ApiClient:
             return self._closed(result)
         if found is None:
             return HttpResult(False, 404, {"error": "unknown_badge", "message": "Сотрудник не найден"}, None, False)
-        sessions = self._directory_sessions()
-        if sessions.network_error or self._blocked(sessions) or not isinstance(sessions.data, list):
-            return self._closed(sessions)
-        user_id = str(found.get("id"))
-        active = any(isinstance(row, dict) and str(row.get("userId")) == user_id and _shift_open(row) for row in sessions.data)
+        opened, failure = self._open_for_user(found.get("id"))
+        if failure is not None:
+            return self._closed(failure)
         name = str(found.get("fullName") or "").strip()
-        return HttpResult(True, 200, {"last_event": "in" if active else "out", "name": name, "fullName": name}, None, False)
+        payload = {"last_event": "in" if opened else "out", "name": name, "fullName": name}
+        if opened is not None:
+            started = _session_started(opened, datetime.now().astimezone())
+            if started is not None:
+                payload["last_time"] = started.isoformat(timespec="seconds")
+        return HttpResult(True, 200, payload, None, False)
 
     def _find_user(self, badge: str) -> tuple[dict | None, HttpResult]:
+        wanted = str(badge or "").strip()
+        folded = wanted.casefold()
+        with self._cache_lock:
+            slot = self._users_cache
+            fresh = slot is not None and time.monotonic() - slot[0] <= DIRECTORY_CACHE_SEC
+            found = None
+            if fresh:
+                exact, folded_index = slot[2]
+                found = exact.get(wanted) if wanted else None
+                if found is None and wanted:
+                    found = folded_index.get(folded)
+                found = dict(found) if isinstance(found, dict) else None
+        if fresh:
+            return found, HttpResult(True, 200, [], None, False)
         result = self._directory_users()
         if not isinstance(result.data, list):
             return None, result
-        wanted = str(badge or "").strip()
-        folded = wanted.casefold()
         fallback = None
         for row in result.data:
             if not isinstance(row, dict):
@@ -631,6 +732,24 @@ class ApiClient:
             if current and current.casefold() == folded:
                 fallback = row
         return fallback, result
+
+    def _open_for_user(self, user_id) -> tuple[dict | None, HttpResult | None]:
+        """Открытая смена из памяти. Второй элемент — сбой загрузки, не «смены нет»."""
+        wanted = str(user_id)
+        with self._cache_lock:
+            slot = self._sessions_cache
+            fresh = slot is not None and time.monotonic() - slot[0] <= DIRECTORY_CACHE_SEC
+            found = None
+            if fresh:
+                found = slot[2].get(wanted)
+                found = dict(found) if isinstance(found, dict) else None
+        if fresh:
+            return found, None
+        sessions = self._directory_sessions()
+        if sessions.network_error or self._blocked(sessions) or not isinstance(sessions.data, list):
+            return None, sessions
+        opened = _open_session(sessions.data, user_id)
+        return (dict(opened) if opened else None), None
 
     def _post_checkin(self, payload: dict) -> HttpResult:
         if self._skip_express():
@@ -680,18 +799,27 @@ class ApiClient:
             return self._closed(result)
         if found is None:
             return HttpResult(False, 404, {"error": "unknown_badge", "message": "Сотрудник не найден"}, None, False)
-        sessions = self._directory_sessions()
-        if sessions.network_error or self._blocked(sessions) or not isinstance(sessions.data, list):
-            return self._closed(sessions)
+        opened, failure = self._open_for_user(found.get("id"))
+        if failure is not None:
+            return self._closed(failure)
         name = str(found.get("fullName") or found.get("login") or "").strip()
         event = str(payload.get("event") or "").strip().lower()
         if event not in ("in", "out"):
-            event = "out" if _open_session(sessions.data, found.get("id")) else "in"
+            event = "out" if opened is not None else "in"
         moment = _event_moment(payload.get("timestamp"))
         logger().info("Отметка %s пишется в базу сайта", badge[:80])
+        if event == "in" and opened is not None:
+            if _shift_is_stale(opened, moment, self._shift_max_hours()):
+                # Вчерашняя смена так и висит. Закрываем её и открываем новую,
+                # иначе человек остаётся «на работе» со вчерашнего прихода.
+                closed = self._close_shift_row(opened, moment)
+                if closed is None or not closed.ok or self._blocked(closed):
+                    return closed
+                opened = None
+            else:
+                # Свежая смена уже открыта: повторный приход её закрывает, а не дублирует.
+                event = "out"
         if event == "in":
-            if _open_session(sessions.data, found.get("id")) is not None:
-                return _checkin_result(name, "in")
             user_id = found.get("id")
             text = str(user_id if user_id is not None else "").strip()
             written = self.write_session(
@@ -709,33 +837,42 @@ class ApiClient:
                 }
             )
         else:
-            current = _open_session(sessions.data, found.get("id"))
+            current = opened
             if current is None or not str(current.get("id") or "").strip():
                 return HttpResult(False, None, None, "Открытая смена ещё не появилась на сервере.", True)
-            minutes = duration_minutes(
-                str(current.get("date") or ""),
-                str(current.get("startTime") or ""),
-                moment.strftime("%Y-%m-%d"),
-                moment.strftime("%H:%M:%S"),
-            )
-            written = self.write_session(
-                {
-                    "op": "update",
-                    "session_id": str(current.get("id")),
-                    "payload": {
-                        "endTime": moment.strftime("%H:%M:%S"),
-                        "durationMinutes": 0 if minutes is None else minutes,
-                        "status": "completed",
-                        "source": "qr",
-                    },
-                }
-            )
-        if written.ok and isinstance(written.data, dict):
+            written = self._close_shift_row(current, moment)
+        if written is not None and written.ok and isinstance(written.data, dict):
             written.data["fullName"] = name or extract_name(written.data)
             written.data["name"] = written.data["fullName"]
             written.data["action"] = "start" if event == "in" else "end"
             written.data["event"] = event
         return written
+
+    def _shift_max_hours(self) -> float:
+        try:
+            return float((self.settings.get("attendance") or {}).get("shift_max_hours") or 16)
+        except (TypeError, ValueError):
+            return 16.0
+
+    def _close_shift_row(self, session: dict, moment: datetime) -> HttpResult:
+        minutes = duration_minutes(
+            str(session.get("date") or ""),
+            str(session.get("startTime") or ""),
+            moment.strftime("%Y-%m-%d"),
+            moment.strftime("%H:%M:%S"),
+        )
+        return self.write_session(
+            {
+                "op": "update",
+                "session_id": str(session.get("id")),
+                "payload": {
+                    "endTime": moment.strftime("%H:%M:%S"),
+                    "durationMinutes": 0 if minutes is None else minutes,
+                    "status": "completed",
+                    "source": "qr",
+                },
+            }
+        )
 
     def operator_profiles(self) -> tuple[list[dict], str]:
         """Профили, которыми можно отмечать смены. Пароли в список не входят."""

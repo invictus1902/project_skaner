@@ -140,7 +140,10 @@ class LoginDialog(tk.Toplevel):
         self.resizable(False, False)
         self.configure(bg=theme["bg"])
         self.attributes("-topmost", True)
-        tk.Label(self, text=title, bg=theme["bg"], fg=theme["text"], font=(serif, 22)).pack(padx=28, pady=(22, 8))
+        tk.Label(self, text=title, bg=theme["bg"], fg=theme["text"], font=(serif, 26)).pack(padx=28, pady=(24, 8))
+        mark = tk.Frame(self, bg=theme["accent"], height=2, width=36, bd=0, highlightthickness=0)
+        mark.pack_propagate(False)
+        mark.pack(pady=(0, 14))
         tk.Label(self, text="Пароль настроек на этом компьютере", bg=theme["bg"], fg=theme["muted"], font=(sans, 11)).pack(padx=28, anchor="w")
         tk.Label(
             self,
@@ -205,7 +208,7 @@ class AdminWindow(tk.Toplevel):
         self.settings = app.settings
         self.title("Настройки · учёт времени")
         place_window(self, 980, 680, min_width=760, min_height=520, align="right")
-        _serif, _serif_bold, self.sans = faces(self)
+        self.serif, _serif_bold, self.sans = faces(self)
         self._style_widgets()
         self._init_vars()
         self._build()
@@ -310,7 +313,10 @@ class AdminWindow(tk.Toplevel):
         theme = self._theme
         head = tk.Frame(self, bg=theme["bg"])
         head.pack(fill="x", padx=18, pady=(14, 2))
-        tk.Label(head, text="Настройки", bg=theme["bg"], fg=theme["text"], font=(self.sans, 20)).pack(anchor="w")
+        tk.Label(head, text="Настройки", bg=theme["bg"], fg=theme["text"], font=(self.serif, 28)).pack(anchor="w")
+        mark = tk.Frame(head, bg=theme["accent"], height=2, width=36, bd=0, highlightthickness=0)
+        mark.pack_propagate(False)
+        mark.pack(anchor="w", pady=(10, 0))
         tk.Label(
             head,
             text="Это окно сворачивается отдельно: экран отметок остаётся на месте. F12 открывает настройки снова.",
@@ -319,7 +325,7 @@ class AdminWindow(tk.Toplevel):
             font=(self.sans, 11),
             wraplength=700,
             justify="left",
-        ).pack(anchor="w", pady=(2, 0))
+        ).pack(anchor="w", pady=(4, 0))
         bar = ttk.Frame(self)
         bar.pack(side="bottom", fill="x", padx=12, pady=(8, 12))
         ttk.Label(bar, textvariable=self.status_text).pack(side="left")

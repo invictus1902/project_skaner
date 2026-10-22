@@ -125,7 +125,9 @@ def decide_event(
     """Следующая отметка: уход, если смена ещё открыта, иначе новый приход."""
     if last_event == "in" and last_time is not None:
         age = now - last_time
-        if timedelta(0) <= age <= timedelta(hours=float(max_hours)):
+        # Отрицательный возраст — часы ушли назад. Смена всё ещё открыта,
+        # второй приход её продублирует.
+        if age <= timedelta(hours=float(max_hours)):
             return "out"
     return "in"
 

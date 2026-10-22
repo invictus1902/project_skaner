@@ -61,6 +61,7 @@ class LogicTests(unittest.TestCase):
         self.assertEqual(decide_event("in", now - timedelta(hours=2), now, 16), "out")
         self.assertEqual(decide_event("out", now - timedelta(hours=1), now, 16), "in")
         self.assertEqual(decide_event("in", now - timedelta(hours=20), now, 16), "in")
+        self.assertEqual(decide_event("in", now + timedelta(minutes=5), now, 16), "out")
 
     def test_render_speech_ignores_unknown_braces(self) -> None:
         text = render_speech("{name}. {event_phrase}. {time}.", {"name": "Анна", "event_phrase": "Приход на работу", "time": "9 часов 0 минут"})
@@ -598,6 +599,245 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(client.canonical_badge("  ADM001 "), "Adm001")
         self.assertEqual(client.canonical_badge("нет-такого"), "нет-такого")
 
+    def _walled_client(self, transport):
+        settings = default_settings()
+        settings["server"]["base_url"] = "https://example.test"
+        settings["server"]["read_url"] = "https://example.test"
+        settings["server"]["write_url"] = "https://example.test"
+        settings["server"]["supabase_url"] = "https://db.test"
+        settings["server"]["supabase_key"] = "anon-key"
+        return ApiClient(settings, transport=transport)
+
+    def test_fresh_open_shift_is_closed_instead_of_a_second_arrival(self) -> None:
+        wall = '{"message":"Protected by Vercel Authentication","protection":{"vercel_auth_enabled":true}}'
+        store = {
+            "rows": [
+                {
+                    "id": 9,
+                    "userId": 2,
+                    "date": "2026-10-14",
+                    "startTime": "09:00:00",
+                    "endTime": None,
+                    "status": "active",
+                }
+            ]
+        }
+        seen = []
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            seen.append((request.method, url))
+            if url.startswith("https://example.test"):
+                return 401, wall.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/users" in url:
+                return 200, '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001"}]'.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/workSessions" in url:
+                return 200, json.dumps(store["rows"]).encode("utf-8")
+            if request.method == "PATCH" and "id=eq.9" in url:
+                body = json.loads(request.data.decode("utf-8"))
+                store["rows"][0].update(body)
+                return 200, json.dumps([store["rows"][0]]).encode("utf-8")
+            return 500, b""
+
+        client = self._walled_client(transport)
+        result = client.post_event(
+            {"badge": "adm001", "event": "in", "timestamp": "2026-10-14T12:00:00+06:00"}
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(extract_event(result.data), "out")
+        self.assertEqual(store["rows"][0]["status"], "completed")
+        self.assertEqual(store["rows"][0]["endTime"], "12:00:00")
+        self.assertEqual(store["rows"][0]["durationMinutes"], 180)
+        self.assertFalse(any(method == "POST" and "workSessions" in url for method, url in seen))
+
+    def test_stale_open_shift_is_closed_and_a_new_one_starts(self) -> None:
+        wall = '{"message":"Protected by Vercel Authentication","protection":{"vercel_auth_enabled":true}}'
+        store = {
+            "rows": [
+                {
+                    "id": 9,
+                    "userId": 2,
+                    "date": "2026-10-13",
+                    "startTime": "08:00:00",
+                    "endTime": None,
+                    "status": "active",
+                }
+            ]
+        }
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            if url.startswith("https://example.test"):
+                return 401, wall.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/users" in url:
+                return 200, '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001"}]'.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/workSessions" in url:
+                return 200, json.dumps(store["rows"]).encode("utf-8")
+            if request.method == "PATCH" and "id=eq.9" in url:
+                body = json.loads(request.data.decode("utf-8"))
+                store["rows"][0].update(body)
+                return 200, json.dumps([store["rows"][0]]).encode("utf-8")
+            if request.method == "POST" and "/rest/v1/workSessions" in url:
+                body = json.loads(request.data.decode("utf-8"))
+                row = {
+                    "id": 10,
+                    "userId": body["userId"],
+                    "date": body["date"],
+                    "startTime": body["startTime"],
+                    "endTime": None,
+                    "status": "active",
+                }
+                store["rows"].append(row)
+                return 201, json.dumps([row]).encode("utf-8")
+            return 500, b""
+
+        client = self._walled_client(transport)
+        result = client.post_event(
+            {"badge": "adm001", "event": "in", "timestamp": "2026-10-14T18:00:00+06:00"}
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(extract_event(result.data), "in")
+        self.assertEqual(store["rows"][0]["status"], "completed")
+        self.assertEqual(store["rows"][0]["endTime"], "18:00:00")
+        self.assertEqual(store["rows"][0]["durationMinutes"], 2040)
+        self.assertEqual(store["rows"][1]["status"], "active")
+        self.assertEqual(store["rows"][1]["startTime"], "18:00:00")
+        self.assertEqual(store["rows"][1]["date"], "2026-10-14")
+
+    def test_empty_shift_representation_is_not_a_saved_shift(self) -> None:
+        wall = '{"message":"Protected by Vercel Authentication","protection":{"vercel_auth_enabled":true}}'
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            if url.startswith("https://example.test"):
+                return 401, wall.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/users" in url:
+                return 200, '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001"}]'.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/workSessions" in url:
+                return 200, b"[]"
+            if request.method == "POST" and "/rest/v1/workSessions" in url:
+                return 201, b"[]"
+            return 500, b""
+
+        client = self._walled_client(transport)
+        result = client.post_event(
+            {"badge": "adm001", "event": "in", "timestamp": "2026-10-14T09:00:00+06:00"}
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, 422)
+
+    def test_open_shift_past_the_row_cap_is_still_the_current_shift(self) -> None:
+        wall = '{"message":"Protected by Vercel Authentication","protection":{"vercel_auth_enabled":true}}'
+        recent = [
+            {
+                "id": 2000 + index,
+                "userId": 9,
+                "date": "2026-10-14",
+                "startTime": "09:00:00",
+                "endTime": "18:00:00",
+                "status": "completed",
+            }
+            for index in range(1000)
+        ]
+        forgotten = {
+            "id": 4,
+            "userId": 2,
+            "date": "2026-09-01",
+            "startTime": "09:00:00",
+            "endTime": None,
+            "status": "active",
+        }
+        patched = {"value": False}
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            if url.startswith("https://example.test"):
+                return 401, wall.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/users" in url:
+                return 200, '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001"}]'.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/workSessions" in url:
+                if "endTime.is.null" in url:
+                    return 200, json.dumps([forgotten]).encode("utf-8")
+                return 200, json.dumps(recent).encode("utf-8")
+            if request.method == "PATCH" and "id=eq.4" in url:
+                patched["value"] = True
+                body = json.loads(request.data.decode("utf-8"))
+                row = dict(forgotten)
+                row.update(body)
+                return 200, json.dumps([row]).encode("utf-8")
+            return 500, b""
+
+        client = self._walled_client(transport)
+        status = client.get_status("adm001")
+        self.assertEqual(status.data["last_event"], "in")
+        self.assertIn("2026-09-01", status.data["last_time"])
+        # Смена старше окна, поэтому приход закрывает её и открывает новую.
+        # Здесь проверяем, что закрывается именно забытая строка, а не «её нет».
+        result = client.post_event(
+            {"badge": "adm001", "event": "out", "timestamp": "2026-10-14T18:00:00+06:00"}
+        )
+        self.assertTrue(result.ok)
+        self.assertTrue(patched["value"])
+        self.assertEqual(extract_event(result.data), "out")
+
+    def test_repeat_lookup_does_not_download_the_directory_again(self) -> None:
+        wall = '{"message":"Protected by Vercel Authentication","protection":{"vercel_auth_enabled":true}}'
+        calls = []
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            calls.append(url)
+            if url.startswith("https://example.test"):
+                return 401, wall.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/users" in url:
+                body = json.dumps(
+                    [
+                        {"id": 1, "fullName": "Первый", "badgeId": "Ab"},
+                        {"id": 2, "fullName": "Второй", "badgeId": "ab"},
+                    ]
+                )
+                return 200, body.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/workSessions" in url:
+                body = json.dumps(
+                    [
+                        {
+                            "id": 3,
+                            "userId": 2,
+                            "date": "2026-10-14",
+                            "startTime": "08:00:00",
+                            "endTime": None,
+                            "status": "active",
+                        },
+                        {
+                            "id": 10,
+                            "userId": 2,
+                            "date": "2026-10-14",
+                            "startTime": "11:00:00",
+                            "endTime": None,
+                            "status": "active",
+                        },
+                    ]
+                )
+                return 200, body.encode("utf-8")
+            return 500, b""
+
+        client = self._walled_client(transport)
+        self.assertEqual(extract_name(client.get_employee("Ab").data), "Первый")
+        self.assertEqual(extract_name(client.get_employee("AB").data), "Второй")
+        status = client.get_status("ab")
+        self.assertEqual(status.data["last_event"], "in")
+        self.assertIn("11:00:00", status.data["last_time"])
+        downloaded = len(calls)
+        self.assertEqual(client.get_status("ab").data["last_event"], "in")
+        self.assertEqual(client.canonical_badge("Ab"), "Ab")
+        self.assertEqual(client.health_state(), "online")
+        self.assertEqual(len(calls), downloaded)
+
     def test_old_single_address_fills_both_links(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "settings.json"
@@ -778,6 +1018,97 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(ui.views[-1]["state"], "out")
                 self.assertEqual(ui.views[-1]["name"], "Иванов Иван")
                 self.assertEqual(db.count_pending(), 0)
+            finally:
+                db.close()
+
+    def test_named_unknown_badge_is_rejected_without_strict_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, ui, _speaker, api = self._service(folder, "http://server")
+            try:
+                api.employee = HttpResult(False, 404, {"error": "unknown_badge"}, None, False)
+                service._process("404")
+                self.assertEqual(ui.views[-1]["state"], "unknown")
+                self.assertEqual(ui.views[-1]["title"], "БЕЙДЖ НЕ НАЙДЕН")
+                self.assertEqual(api.posts, [])
+                self.assertEqual(db.count_pending(), 0)
+            finally:
+                db.close()
+
+    def test_plain_404_without_strict_mode_is_still_stored(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, ui, _speaker, api = self._service(folder, "http://server")
+            try:
+                api.employee = HttpResult(False, 404, {}, None, False)
+                service._process("4040")
+                self.assertEqual(ui.views[-1]["state"], "offline")
+                self.assertEqual(db.pending_events()[0]["event_type"], "in")
+            finally:
+                db.close()
+
+    def test_unknown_badge_does_not_eat_the_next_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, ui, _speaker, api = self._service(folder, "http://server")
+            try:
+                service.settings["scanner"]["cooldown_sec"] = 30
+                service.settings["server"]["strict_employee_check"] = True
+                api.employee = HttpResult(False, 404, {"error": "unknown_badge"}, None, False)
+                service._process("55001")
+                service._process("55001")
+                self.assertEqual([view["state"] for view in ui.views], ["unknown", "unknown"])
+            finally:
+                db.close()
+
+    def test_cooldown_blocks_a_second_real_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, ui, _speaker, _api = self._service(folder, "http://server")
+            try:
+                service.settings["scanner"]["cooldown_sec"] = 30
+                service._process("55001")
+                service._process("55001")
+                self.assertEqual(ui.views[-1]["state"], "duplicate")
+                self.assertEqual([row["event_type"] for row in db.pending_events()], ["in"])
+            finally:
+                db.close()
+
+    def test_stale_server_shift_starts_a_new_arrival(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, _db, ui, _speaker, api = self._service(folder, "http://server")
+            try:
+                old = (datetime.now().astimezone() - timedelta(hours=20)).isoformat()
+                api.employee = HttpResult(True, 200, {"name": "Иван", "active": True}, None, False)
+                api.status = HttpResult(True, 200, {"last_event": "in", "last_time": old, "name": "Иван"}, None, False)
+                api.post = HttpResult(True, 200, {"ok": True, "event": "in", "name": "Иван"}, None, False)
+                service._process("10001")
+                self.assertEqual(api.posts[0]["event"], "in")
+                self.assertEqual(ui.views[-1]["title"], "ПРИХОД")
+            finally:
+                _db.close()
+
+    def test_waiting_shift_does_not_block_other_badges(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, _ui, _speaker, _api = self._service(folder, "http://server")
+            try:
+                class SelectiveApi(StubApi):
+                    def post_event(self, payload):
+                        self.posts.append(payload)
+                        if payload["badge"] == "A":
+                            return HttpResult(
+                                False,
+                                None,
+                                None,
+                                "Открытая смена ещё не появилась на сервере.",
+                                True,
+                            )
+                        return HttpResult(True, 200, {"ok": True, "event": payload["event"], "name": "Б"}, None, False)
+
+                service.api = SelectiveApi()
+                moment = datetime.now().astimezone()
+                db.insert_event("A", "А", "out", moment, {"badge": "A", "event": "out"})
+                db.insert_event("B", "Б", "in", moment, {"badge": "B", "event": "in"})
+                service._flush_pending()
+                self.assertEqual(db.get_event(1)["status"], "pending")
+                self.assertEqual(db.get_event(2)["status"], "sent")
+                self.assertEqual([item["badge"] for item in service.api.posts], ["A", "B"])
             finally:
                 db.close()
 

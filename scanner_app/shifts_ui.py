@@ -32,7 +32,7 @@ class ShiftsWindow(tk.Toplevel):
         self.title("Смены · учёт времени")
         place_window(self, 1040, 660, min_width=760, min_height=520, align="right", dy=40)
         self._theme = theme_by_name((app.settings.get("ui") or {}).get("theme") or "dark")
-        _serif, _bold, self.sans = faces(self)
+        self.serif, _bold, self.sans = faces(self)
         self._users: list[dict] = []
         self._sessions: list[dict] = []
         self._selected_user = None
@@ -63,13 +63,17 @@ class ShiftsWindow(tk.Toplevel):
     def _build(self) -> None:
         top = ttk.Frame(self)
         top.pack(fill="x", padx=20, pady=(16, 4))
-        ttk.Label(top, text="Смены", font=(self.sans, 22)).pack(anchor="w")
+        tk.Label(top, text="Смены", bg=self._theme["bg"], fg=self._theme["text"], font=(self.serif, 28)).pack(anchor="w")
+        mark = tk.Frame(top, bg=self._theme["accent"], height=2, width=36, bd=0, highlightthickness=0)
+        mark.pack_propagate(False)
+        mark.pack(anchor="w", pady=(8, 0))
         ttk.Label(
             top,
             text="Окно сворачивается отдельно от остальных. Esc — закрыть.",
+            style="Muted.TLabel",
             wraplength=700,
             justify="left",
-        ).pack(anchor="w", pady=(2, 0))
+        ).pack(anchor="w", pady=(4, 0))
         ttk.Label(top, textvariable=self._status, wraplength=700, justify="left").pack(anchor="w", pady=(4, 0))
 
         search = ttk.Frame(self)
@@ -116,7 +120,7 @@ class ShiftsWindow(tk.Toplevel):
         self.people.tag_configure("never", foreground=self._theme["muted"])
         self.people.bind("<<TreeviewSelect>>", lambda _event: self._fill_sessions())
 
-        ttk.Label(right, textvariable=self._person_title, font=(self.sans, 16)).pack(anchor="w", pady=(0, 8))
+        ttk.Label(right, textvariable=self._person_title, font=(self.serif, 22)).pack(anchor="w", pady=(0, 8))
         actions = ttk.Frame(right)
         actions.pack(fill="x", pady=(0, 8))
         ttk.Button(actions, text="Начать смену", command=self._start, style="Accent.TButton").pack(side="left")
