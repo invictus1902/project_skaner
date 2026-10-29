@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import threading
 import tkinter as tk
@@ -32,21 +33,22 @@ STATUS_TEXT = {
     "rejected": "отклонено",
 }
 FONT_BASE = {
-    "clock": 36,
-    "title": 22,
-    "date": 13,
-    "status": 44,
-    "name": 32,
-    "when": 18,
-    "detail": 15,
-    "history": 14,
+    "clock": 34,
+    "title": 18,
+    "date": 12,
+    "status": 40,
+    "name": 40,
+    "when": 20,
+    "detail": 16,
+    "history": 13,
     "heading": 12,
     "kicker": 11,
     "small": 12,
     "footer": 15,
 }
-SERIF_FONTS = {"title", "status", "name", "clock", "date"}
-BOLD_FONTS = {"status", "name", "clock"}
+SERIF_FONTS = {"title", "status", "name"}
+BOLD_FONTS = {"status", "name"}
+MONO_FONTS = {"clock", "date", "kicker", "when"}
 
 
 def enable_dpi() -> None:
@@ -59,6 +61,49 @@ def enable_dpi() -> None:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+
+
+def _mix(a: str, b: str, t: float) -> str:
+    """Смешать два цвета #rrggbb. t = 0 даёт первый, t = 1 — второй."""
+    t = 0.0 if t < 0 else 1.0 if t > 1 else t
+    color_a = a.lstrip("#")
+    color_b = b.lstrip("#")
+    channels = []
+    for index in (0, 2, 4):
+        left = int(color_a[index : index + 2], 16)
+        right = int(color_b[index : index + 2], 16)
+        channels.append(int(left + (right - left) * t))
+    return "#{:02x}{:02x}{:02x}".format(channels[0], channels[1], channels[2])
+
+
+def _same_color(a: str, b: str) -> bool:
+    return str(a).strip().lower() == str(b).strip().lower()
+
+
+def _ease(step: int, steps: int) -> float:
+    """Плавный разгон: в начале медленно, к концу точно 1."""
+    if step >= steps:
+        return 1.0
+    return 1 - (1 - step / float(steps)) ** 3
+
+
+def _wrap_lines(text: str, font, width: int) -> list:
+    words = str(text or "").split()
+    if not words:
+        return [""]
+    lines = []
+    current = ""
+    limit = max(40, int(width))
+    for word in words:
+        trial = word if not current else current + " " + word
+        if not current or font.measure(trial) <= limit:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines or [""]
 
 
 def keyboard_language() -> int | None:
@@ -100,12 +145,42 @@ class KioskApp:
         self._layout_language = None
         self._configured_size = (0, 0)
         self._history_key = None
+        self._anim_token = 0
+        self._pulse_phase = 0.0
+        self._status_text = ""
+        self._button_hot = False
+        self._pill_width = None
+        self._pill_color = None
+        self._pill_fg = None
+        self._pill_anim = None
+        self._pill_dirty = False
+        self._glow_boost = 0.0
+        self._status_animating = False
+        self._fitting = False
+        self._drawing_action = False
+        self._banner_fit = False
+        self._panel_stamp = None
+        self._stack_key = None
+        self._metrics_key = None
+        self._metrics_value = None
+        self._pill_glow: list = []
+        self._pill_ring: list = []
+        self._pill_body: list = []
+        self._pill_text = None
+        self._pill_text_key = None
+        self._reveal_token = 0
+        self._reveal_key = None
+        self._history_motion = None
+        self._history_fade_token = 0
+        self._button_pressed = False
+        self._button_press_token = 0
 
         self.root = tk.Tk()
         self.root.title(self.settings["ui"]["title"])
         self.root.minsize(800, 560)
         self.root.report_callback_exception = self._report_error
         self.serif, self.serif_bold, self.sans = faces(self.root)
+        self.mono = self._mono_family()
         self.fonts = {
             name: tkfont.Font(
                 root=self.root,
@@ -132,6 +207,7 @@ class KioskApp:
         self._clock_loop()
         self._health_loop()
         self.root.after(2500, self._paint_voice_warning)
+        self.root.after(40, self._pulse)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<F11>", self._toggle_fullscreen)
         self.root.bind("<F12>", lambda _event: self.open_admin())
@@ -278,105 +354,72 @@ class KioskApp:
     def _build(self) -> None:
         self.header = tk.Frame(self.root)
         self.brand = tk.Frame(self.header)
+        self.brand_mark = tk.Canvas(self.brand, width=14, height=14, highlightthickness=0, bd=0)
         self.title_label = tk.Label(self.brand, text=self.settings["ui"]["title"], anchor="w", font=self.fonts["title"])
-        self.brand_mark = tk.Frame(self.brand, height=2, width=36, bd=0, highlightthickness=0)
-        self.brand_mark.pack_propagate(False)
-        self.title_label.pack(anchor="w")
-        self.brand_mark.pack(anchor="w", pady=(8, 0))
+        self.brand_mark.pack(side="left", padx=(0, 12))
+        self.title_label.pack(side="left", anchor="w")
         self.status_row = tk.Frame(self.header)
         self.dot = tk.Canvas(self.status_row, width=14, height=14, highlightthickness=0, bd=0)
         self.dot_id = self.dot.create_oval(2, 2, 12, 12, outline="")
         self.link_label = tk.Label(self.status_row, anchor="w", font=self.fonts["small"])
         self.device_label = tk.Label(self.status_row, text="", anchor="w", font=self.fonts["small"])
+        self.device_label.pack(side="left", padx=(0, 16))
         self.dot.pack(side="left")
         self.link_label.pack(side="left", padx=(8, 0))
-        self.device_label.pack(side="left", padx=(16, 0))
-        self.clock_label = tk.Label(self.header, anchor="e", font=self.fonts["clock"])
-        self.date_label = tk.Label(self.header, anchor="e", font=self.fonts["date"])
-        self.brand.grid(row=0, column=0, sticky="w", padx=(32, 12), pady=(16, 0))
-        self.status_row.grid(row=1, column=0, sticky="w", padx=(32, 12), pady=(6, 12))
-        self.clock_label.grid(row=0, column=1, sticky="ne", padx=(8, 32), pady=(12, 0))
-        self.date_label.grid(row=1, column=1, sticky="ne", padx=(8, 32), pady=(0, 12))
-        self.header.columnconfigure(0, weight=1)
+        self.brand.pack(side="left", padx=(28, 12), pady=16)
+        self.status_row.pack(side="right", padx=(12, 28), pady=16)
         self.header_rule = tk.Frame(self.root, height=1, bd=0, highlightthickness=0)
         self.header_rule.pack_propagate(False)
 
         self.banner = tk.Frame(self.root)
-        self.banner_label = tk.Label(self.banner, anchor="w", justify="left", font=self.fonts["small"], wraplength=1100)
-        self.banner_label.pack(fill="x", padx=28, pady=8)
+        self.banner_canvas = tk.Canvas(self.banner, height=48, highlightthickness=0, bd=0)
+        self.banner_canvas.pack(fill="x", padx=32, pady=(10, 0))
+        self.banner_canvas.bind("<Configure>", self._draw_banner)
 
-        self.center_wrap = tk.Frame(self.root)
-        self.center = tk.Frame(self.center_wrap)
-        self.signal = tk.Frame(self.center, bd=0, highlightthickness=0)
-        self.copy = tk.Frame(self.center, bd=0, highlightthickness=0)
-        self.signal_rail = tk.Frame(self.signal, width=4, bd=0, highlightthickness=0)
-        self.signal_rail.pack_propagate(False)
-        self.signal_body = tk.Frame(self.signal, bd=0, highlightthickness=0)
-        self.signal.columnconfigure(1, weight=1)
-        self.signal.rowconfigure(0, weight=1)
-        self.signal_rail.grid(row=0, column=0, sticky="ns")
-        self.signal_body.grid(row=0, column=1, sticky="nsew")
-        self.signal_top = tk.Frame(self.signal_body)
-        self.signal_bottom = tk.Frame(self.signal_body)
-        self.copy_pad = tk.Frame(self.copy, height=18, bd=0, highlightthickness=0)
-        self.copy_pad.pack_propagate(False)
-        self.copy_bottom = tk.Frame(self.copy)
-        self.copy_mark = tk.Frame(self.copy, height=2, width=36, bd=0, highlightthickness=0)
-        self.copy_mark.pack_propagate(False)
-        self.center_top = self.signal_top
-        self.center_bottom = self.copy_bottom
-        self.status_label = tk.Label(self.signal_body, font=self.fonts["status"], anchor="center", justify="center")
-        self.copy_kicker = tk.Label(self.copy, font=self.fonts["kicker"], anchor="w")
-        self.name_label = tk.Label(self.copy, font=self.fonts["name"], anchor="w", justify="left")
-        self.when_label = tk.Label(self.copy, font=self.fonts["when"], anchor="w", justify="left")
-        self.badge_label = tk.Label(self.copy, font=self.fonts["detail"], anchor="w", justify="left")
-        self.detail_label = tk.Label(self.copy, font=self.fonts["detail"], anchor="w", justify="left", wraplength=640)
-        self.center.columnconfigure(0, weight=4, minsize=280)
-        self.center.columnconfigure(1, weight=8)
-        self.center.rowconfigure(0, weight=1)
-        self.signal.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
-        self.copy.grid(row=0, column=1, sticky="nsew")
-        self.signal_top.pack(fill="both", expand=True)
-        self.signal_bottom.pack(fill="both", expand=True)
-        self.copy_pad.pack(fill="x")
+        self.body = tk.Frame(self.root)
+        self.center_wrap = self.body
+        self.rail = tk.Frame(self.body, width=292, bd=0, highlightthickness=0)
+        self.rail.pack_propagate(False)
+        self.history = self.rail
+        self.rail_edge = tk.Frame(self.body, width=1, bd=0, highlightthickness=0)
+        self.rail_edge.pack_propagate(False)
+        self.stage = tk.Frame(self.body, bd=0, highlightthickness=0)
+        self.center = self.stage
+        self.clock_label = tk.Label(self.rail, anchor="w", font=self.fonts["clock"])
+        self.date_label = tk.Label(self.rail, anchor="w", font=self.fonts["date"])
+        self.rail_rule = tk.Frame(self.rail, height=1, bd=0, highlightthickness=0)
+        self.rail_rule.pack_propagate(False)
+        self.history_title = tk.Label(self.rail, text="Последние отметки", anchor="w", font=self.fonts["heading"])
+        self.history_rows = tk.Frame(self.rail, bd=0, highlightthickness=0)
+        self.clock_label.pack(anchor="w", padx=22, pady=(22, 0))
+        self.date_label.pack(anchor="w", padx=22, pady=(2, 0))
+        self.rail_rule.pack(fill="x", padx=22, pady=(16, 12))
+        self.history_title.pack(anchor="w", padx=22, pady=(0, 10))
+        self.history_rows.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+        self.rail.pack(side="left", fill="y")
+        self.rail_edge.pack(side="left", fill="y")
+        self.stage.pack(side="left", fill="both", expand=True)
+
+        self.copy = tk.Frame(self.stage, bd=0, highlightthickness=0)
+        self.copy.pack(fill="both", expand=True, padx=56, pady=(8, 12))
+        self.copy_top = tk.Frame(self.copy, bd=0, highlightthickness=0)
+        self.copy_bottom = tk.Frame(self.copy, bd=0, highlightthickness=0)
+        self.copy_top.pack(fill="both", expand=True)
         self.copy_bottom.pack(fill="both", expand=True)
-
-        self.history = tk.Frame(self.root)
-        self.history_title = tk.Label(self.history, text="Последние отметки", anchor="w", font=self.fonts["heading"])
-        self.history_title.pack(fill="x", padx=32, pady=(0, 4))
-        self.history_card = tk.Frame(self.history, highlightthickness=0, bd=0)
-        self.history_card.pack(fill="x", padx=32, pady=(0, 6))
-        self.history_head = tk.Frame(self.history_card, bd=0, highlightthickness=0)
-        self.history_head.pack(fill="x")
-        self.history_head.columnconfigure(0, minsize=4)
-        self.history_head.columnconfigure(1, minsize=150)
-        self.history_head.columnconfigure(2, weight=1)
-        self.history_head.columnconfigure(3, minsize=120)
-        self.history_head.columnconfigure(4, minsize=130)
-        self._history_headers = []
-        for column, text, anchor in (
-            (1, "Время", "w"),
-            (2, "Сотрудник", "w"),
-            (3, "Событие", "w"),
-            (4, "Статус", "e"),
-        ):
-            label = tk.Label(self.history_head, text=text, anchor=anchor, font=self.fonts["kicker"])
-            label.grid(
-                row=0,
-                column=column,
-                sticky="ew",
-                padx=(14 if column == 1 else 8, 18 if column == 4 else 8),
-                pady=(0, 6),
-            )
-            self._history_headers.append(label)
-        self.history_head_rule = tk.Frame(self.history_card, height=1, bd=0, highlightthickness=0)
-        self.history_head_rule.pack_propagate(False)
-        self.history_head_rule.pack(fill="x")
-        self.history_rows = tk.Frame(self.history_card)
-        self.history_rows.pack(fill="x", pady=(2, 0))
+        self.signal = tk.Canvas(self.copy, height=120, highlightthickness=0, bd=0)
+        self.signal_body = self.signal
+        self.signal.pack(fill="x", pady=(0, 14), before=self.copy_bottom)
+        self.signal.bind("<Configure>", self._on_signal_configure)
+        self.copy_kicker = tk.Label(self.copy, font=self.fonts["kicker"], anchor="center", justify="center")
+        self.name_label = tk.Label(self.copy, font=self.fonts["name"], anchor="center", justify="center")
+        self.when_label = tk.Label(self.copy, font=self.fonts["when"], anchor="center", justify="center")
+        self.badge_label = tk.Label(self.copy, font=self.fonts["detail"], anchor="center", justify="center")
+        self.detail_label = tk.Label(
+            self.copy, font=self.fonts["detail"], anchor="center", justify="center", wraplength=640
+        )
 
         self.footer = tk.Frame(self.root)
-        self.action_row = tk.Frame(self.footer, bd=0, highlightthickness=1)
+        self.action_row = tk.Frame(self.footer, bd=0, highlightthickness=0)
         self.meta_row = tk.Frame(self.footer)
         self.manual_var = tk.StringVar()
         self.manual_label = tk.Label(self.action_row, text="Код бейджа", anchor="w", font=self.fonts["small"])
@@ -387,16 +430,18 @@ class KioskApp:
             relief="flat",
             highlightthickness=1,
         )
-        self.manual_button = tk.Button(
+        self.manual_button = tk.Canvas(
             self.action_row,
-            text="Отметить",
-            font=self.fonts["small"],
-            relief="flat",
-            padx=18,
-            pady=4,
+            width=176,
+            height=44,
+            highlightthickness=0,
+            bd=0,
             cursor="hand2",
-            command=self._submit_manual,
         )
+        self.manual_button.bind("<Button-1>", self._button_press)
+        self.manual_button.bind("<Enter>", self._button_enter)
+        self.manual_button.bind("<Leave>", self._button_leave)
+        self.manual_button.bind("<Configure>", lambda _event: self._draw_action())
         self.hint_label = tk.Label(self.meta_row, text="F12 — настройки", anchor="w", font=self.fonts["small"])
         self.pending_label = tk.Label(self.meta_row, anchor="w", font=self.fonts["small"])
         self.voice_label = tk.Label(self.meta_row, anchor="w", font=self.fonts["small"])
@@ -414,7 +459,7 @@ class KioskApp:
         self.action_row.columnconfigure(1, weight=1)
         self.manual_label.grid(row=0, column=0, sticky="w", padx=(16, 10), pady=8)
         self.manual_entry.grid(row=0, column=1, sticky="ew", pady=8, ipady=6, ipadx=8)
-        self.manual_button.grid(row=0, column=2, sticky="nsew", padx=(10, 16), pady=8)
+        self.manual_button.grid(row=0, column=2, padx=(12, 18), pady=10)
         self.hint_label.pack(side="left", padx=(16, 12), pady=(2, 6))
         self.pending_label.pack(side="left", padx=(0, 12), pady=(2, 6))
         self.voice_label.pack(side="left", padx=(0, 12), pady=(2, 6))
@@ -434,11 +479,9 @@ class KioskApp:
         self.header_rule.grid(row=1, column=0, sticky="ew")
         self.banner.grid(row=2, column=0, sticky="ew")
         self.banner.grid_remove()
-        self.center_wrap.grid(row=3, column=0, sticky="nsew")
-        self.history.grid(row=4, column=0, sticky="ew")
-        self.footer_rule.grid(row=5, column=0, sticky="ew")
-        self.footer.grid(row=6, column=0, sticky="ew")
-        self.center.pack(fill="both", expand=True, padx=32, pady=(12, 10))
+        self.body.grid(row=3, column=0, sticky="nsew")
+        self.footer_rule.grid(row=4, column=0, sticky="ew")
+        self.footer.grid(row=5, column=0, sticky="ew")
         self.root.bind("<Configure>", self._on_configure)
 
     def _manual_focus(self, _event=None) -> None:
@@ -490,8 +533,8 @@ class KioskApp:
         self._generation += 1
         generation = self._generation
         self._state = view.get("state") or "idle"
+        self._status_text = view.get("title") or ""
         self._paint_panel(self._state)
-        self.status_label.configure(text=view.get("title") or "")
         self.name_label.configure(text=view.get("name") or "")
         self.when_label.configure(text=view.get("when") or "")
         badge = view.get("badge") or ""
@@ -501,6 +544,8 @@ class KioskApp:
             self.badge_label.configure(text="")
         self.detail_label.configure(text=view.get("detail") or "")
         self._stack_lines()
+        self._play_status()
+        self._start_reveal()
         for callback in list(self._result_subs):
             try:
                 callback(view)
@@ -511,56 +556,550 @@ class KioskApp:
             self.root.after(delay, lambda token=generation: self._return_idle(token))
 
     def _stack_lines(self) -> None:
-        self.status_label.pack_forget()
-        if str(self.status_label.cget("text") or "").strip():
-            self.status_label.pack(fill="x", padx=22, before=self.signal_bottom)
         name = str(self.name_label.cget("text") or "").strip()
-        self.copy_kicker.configure(text="Сотрудник" if name else "Сканер")
-        for widget in (self.copy_kicker, self.name_label, self.when_label, self.badge_label, self.copy_mark, self.detail_label):
+        kicker = "Сотрудник" if name else "Сканер"
+        shown = tuple(
+            widget
+            for widget in (self.name_label, self.when_label, self.badge_label, self.detail_label)
+            if str(widget.cget("text") or "").strip()
+        )
+        key = (kicker, shown)
+        if key == self._stack_key:
+            return
+        self._stack_key = key
+        self.copy_kicker.configure(text=kicker)
+        for widget in (self.copy_kicker, self.name_label, self.when_label, self.badge_label, self.detail_label):
             widget.pack_forget()
-        self.copy_kicker.pack(fill="x", padx=32, pady=(0, 6), before=self.copy_bottom)
+        self.copy_kicker.pack(anchor="center", fill="x", pady=(0, 2), before=self.copy_bottom)
         previous = self.copy_kicker
-        for widget in (self.name_label, self.when_label, self.badge_label):
-            if not str(widget.cget("text") or "").strip():
-                continue
-            widget.pack(fill="x", padx=32, pady=(6, 0), after=previous)
+        for widget in shown:
+            space = (14, 0) if widget is self.detail_label else (4, 0)
+            widget.pack(anchor="center", fill="x", pady=space, after=previous)
             previous = widget
-        self.copy_mark.pack(anchor="w", padx=32, pady=(10, 8), after=previous)
-        if str(self.detail_label.cget("text") or "").strip():
-            self.detail_label.pack(fill="x", padx=32, after=self.copy_mark)
 
     def _return_idle(self, generation: int) -> None:
         if self._alive and generation == self._generation:
             self._render_idle()
 
-    def _paint_panel(self, state: str) -> None:
+    def _start_reveal(self) -> None:
+        """Проявить строки результата из фона. В конце цвет темы, без промежуточного оттенка."""
         theme = self._theme()
-        panel = theme["panels"].get(state) or theme["panels"]["idle"]
-        contrast = (self.settings["ui"].get("theme") or "dark") == "contrast"
-        edge = theme["line"]
-        self.center.configure(bg=theme["bg"], highlightthickness=0)
-        self.center_wrap.configure(bg=theme["bg"])
-        for frame in (self.signal, self.signal_body, self.signal_top, self.signal_bottom):
-            frame.configure(bg=panel["bg"])
-        self.signal_rail.configure(bg=theme["accent"])
-        self.signal.configure(
-            highlightthickness=1 if contrast else 0,
-            highlightbackground=edge,
-            highlightcolor=edge,
+        page = theme["bg"]
+        targets = (
+            (self.copy_kicker, theme["accent"]),
+            (self.name_label, theme["text"]),
+            (self.when_label, theme["text"]),
+            (self.badge_label, theme["muted"]),
+            (self.detail_label, theme["muted"]),
         )
-        self.status_label.configure(bg=panel["bg"], fg=panel["fg"])
-        copy_bg = theme["row"]
-        for frame in (self.copy, self.copy_pad, self.copy_bottom):
-            frame.configure(bg=copy_bg)
-        self.copy.configure(highlightthickness=1, highlightbackground=edge, highlightcolor=edge)
-        self.copy_mark.configure(bg=theme["accent"])
-        self.copy_kicker.configure(bg=copy_bg, fg=theme["accent"])
-        self.name_label.configure(bg=copy_bg, fg=theme["text"])
-        self.when_label.configure(bg=copy_bg, fg=theme["text"])
+        key = tuple((str(widget.cget("text") or ""), color) for widget, color in targets)
+        if key == self._reveal_key:
+            return
+        self._reveal_key = key
+        self._reveal_token += 1
+        token = self._reveal_token
+        pairs = []
+        for widget, color in targets:
+            if not str(widget.cget("text") or "").strip():
+                widget.configure(fg=color)
+                continue
+            widget.configure(fg=page)
+            pairs.append((widget, color))
+        if pairs:
+            self._reveal_step(token, pairs, page, 0)
+
+    def _reveal_step(self, token: int, pairs, page: str, step: int) -> None:
+        if not self._alive or token != self._reveal_token:
+            return
+        steps = 9
+        done = step >= steps
+        t = _ease(step, steps)
+        try:
+            for widget, color in pairs:
+                widget.configure(fg=color if done else _mix(page, color, t))
+        except tk.TclError:
+            return
+        if done:
+            return
+        try:
+            self.root.after(
+                16,
+                lambda token=token, pairs=pairs, page=page, step=step + 1: self._reveal_step(token, pairs, page, step),
+            )
+        except tk.TclError:
+            pass
+
+    def _mono_family(self) -> str:
+        available = set(tkfont.families(self.root))
+        for name in ("Cascadia Mono", "Consolas", "Lucida Console", "Courier New"):
+            if name in available:
+                return name
+        return self.sans
+
+    def _capsule(self, canvas, x1: float, y1: float, x2: float, y2: float, fill: str, tag: str, items=None) -> list:
+        """Нарисовать капсулу. Повторный вызов двигает уже созданные фигуры, а не собирает их заново."""
+        items = list(items or [])
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            for item in items:
+                canvas.itemconfigure(item, state="hidden")
+            return items
+        height = y2 - y1
+        if x2 - x1 <= height:
+            boxes = [(x1, y1, x2, y2)]
+            kinds = ("oval",)
+        else:
+            boxes = [
+                (x1, y1, x1 + height, y2),
+                (x2 - height, y1, x2, y2),
+                (x1 + height / 2, y1, x2 - height / 2, y2),
+            ]
+            kinds = ("oval", "oval", "rectangle")
+        if len(items) != len(boxes):
+            for item in items:
+                canvas.delete(item)
+            items = []
+            for kind, box in zip(kinds, boxes):
+                if kind == "oval":
+                    items.append(canvas.create_oval(*box, fill=fill, outline="", tags=tag))
+                else:
+                    items.append(canvas.create_rectangle(*box, fill=fill, outline="", tags=tag))
+            return items
+        for item, box in zip(items, boxes):
+            canvas.coords(item, *box)
+            canvas.itemconfigure(item, fill=fill, state="normal")
+        return items
+
+    def _status_metrics(self, canvas_w: int):
+        font = self.fonts["status"]
+        key = (int(canvas_w), self._status_text, str(font.cget("family")), int(font.cget("size")))
+        if key == self._metrics_key:
+            return self._metrics_value
+        pad = 108
+        max_pill = max(160, canvas_w - 36)
+        lines = _wrap_lines(self._status_text, font, max(80, max_pill - pad))
+        text_w = 0
+        for line in lines:
+            text_w = max(text_w, font.measure(line))
+        line_h = max(font.metrics("linespace"), 14)
+        text_h = line_h * len(lines)
+        pill_h = text_h + 42
+        pill_w = min(max_pill, max(text_w + pad, int(pill_h * 2.8)))
+        self._metrics_key = key
+        self._metrics_value = (text_h, pill_w, pill_h)
+        return self._metrics_value
+
+    def _pill_spec(self):
+        try:
+            canvas_w = int(self.signal.winfo_width())
+        except tk.TclError:
+            return None
+        if canvas_w < 40:
+            return None
+        theme = self._theme()
+        panel = theme["panels"].get(self._state) or theme["panels"]["idle"]
+        _text_h, pill_w, _pill_h = self._status_metrics(canvas_w)
+        return pill_w, panel["bg"], panel["fg"]
+
+    def _fit_signal(self) -> None:
+        if self._fitting:
+            return
+        try:
+            canvas_w = int(self.signal.winfo_width())
+        except tk.TclError:
+            return
+        if canvas_w < 40:
+            return
+        self._fitting = True
+        try:
+            _text_h, _pill_w, pill_h = self._status_metrics(canvas_w)
+            target = int(pill_h + 36)
+            current = int(float(self.signal.cget("height")))
+            if abs(current - target) > 2:
+                self.signal.configure(height=target)
+        finally:
+            self._fitting = False
+
+    def _draw_brand(self) -> None:
+        theme = self._theme()
+        canvas = self.brand_mark
+        canvas.configure(bg=theme["header"])
+        canvas.delete("all")
+        canvas.create_oval(1, 1, 13, 13, fill=theme["accent2"], outline="")
+
+    def _draw_pill(self) -> None:
+        canvas = self.signal
+        theme = self._theme()
+        page = theme["bg"]
+        panel = theme["panels"].get(self._state) or theme["panels"]["idle"]
+        try:
+            width = int(canvas.winfo_width())
+            height = int(canvas.winfo_height())
+        except tk.TclError:
+            return
+        if width < 20 or height < 20:
+            return
+        if str(canvas.cget("bg")) != page:
+            canvas.configure(bg=page)
+        try:
+            self._paint_pill(canvas, theme, page, panel, width, height)
+        except tk.TclError:
+            self._pill_glow = []
+            self._pill_ring = []
+            self._pill_body = []
+            self._pill_text = None
+            self._pill_text_key = None
+            try:
+                canvas.delete("pill")
+            except tk.TclError:
+                pass
+
+    def _paint_pill(self, canvas, theme, page, panel, width: int, height: int) -> None:
+        _text_h, pill_w, pill_h = self._status_metrics(width)
+        draw_w = pill_w if self._pill_width is None else self._pill_width
+        draw_w = max(pill_h * 2.1, min(width - 28, draw_w))
+        fill = self._pill_color or panel["bg"]
+        fg = self._pill_fg or panel["fg"]
+        idle = self._state in ("idle", "progress") and not self._status_animating
+        wave = 0.5 + 0.5 * math.sin(self._pulse_phase)
+        if idle:
+            fill = _mix(fill, fg, 0.03 + 0.045 * wave)
+        y1 = (height - pill_h) / 2.0
+        y2 = y1 + pill_h
+        x1 = (width - draw_w) / 2.0
+        x2 = x1 + draw_w
+        boost = max(0.0, self._glow_boost)
+        glow_pad = 9 + 7 * boost + (3 * wave if idle else 0)
+        glow = _mix(page, fill, min(0.7, 0.24 + (0.12 * wave if idle else 0.0) + 0.32 * boost))
+        previous = (tuple(self._pill_glow), tuple(self._pill_ring), tuple(self._pill_body), self._pill_text)
+        self._pill_glow = self._capsule(
+            canvas,
+            x1 - glow_pad,
+            y1 - glow_pad * 0.72,
+            x2 + glow_pad,
+            y2 + glow_pad * 0.72,
+            glow,
+            "pill",
+            self._pill_glow,
+        )
+        color_animating = False
+        anim = self._pill_anim
+        if self._status_animating and anim and len(anim) >= 6:
+            color_animating = not (_same_color(anim[2], anim[3]) and _same_color(anim[4], anim[5]))
+        show_ring = _same_color(fill, page) or (self._state in ("idle", "progress") and not color_animating)
+        if show_ring:
+            ring = fg if _same_color(fill, page) else theme["accent"]
+            self._pill_ring = self._capsule(
+                canvas, x1 - 1.5, y1 - 1.5, x2 + 1.5, y2 + 1.5, ring, "pill", self._pill_ring
+            )
+        else:
+            for item in self._pill_ring:
+                canvas.itemconfigure(item, state="hidden")
+        self._pill_body = self._capsule(canvas, x1, y1, x2, y2, fill, "pill", self._pill_body)
+        text_width = max(80, draw_w - 96)
+        text_key = (self._status_text, fg, int(text_width), width, height, int(self.fonts["status"].cget("size")))
+        if self._pill_text is None:
+            self._pill_text = canvas.create_text(
+                width / 2.0,
+                height / 2.0,
+                text=self._status_text,
+                font=self.fonts["status"],
+                fill=fg,
+                width=text_width,
+                justify="center",
+                tags="pill",
+            )
+            self._pill_text_key = text_key
+        elif text_key != self._pill_text_key:
+            canvas.coords(self._pill_text, width / 2.0, height / 2.0)
+            canvas.itemconfigure(
+                self._pill_text,
+                text=self._status_text,
+                font=self.fonts["status"],
+                fill=fg,
+                width=text_width,
+            )
+            self._pill_text_key = text_key
+        current = (tuple(self._pill_glow), tuple(self._pill_ring), tuple(self._pill_body), self._pill_text)
+        if current != previous:
+            for group in (self._pill_glow, self._pill_ring, self._pill_body):
+                for item in group:
+                    canvas.tag_raise(item)
+            if self._pill_text is not None:
+                canvas.tag_raise(self._pill_text)
+
+    def _play_status(self) -> None:
+        self._anim_token += 1
+        token = self._anim_token
+        spec = self._pill_spec()
+        if spec is None:
+            self._pill_dirty = True
+            return
+        self._pill_dirty = False
+        target_w, target_bg, target_fg = spec
+        start_w = target_w if self._pill_width is None else float(self._pill_width)
+        start_bg = self._pill_color or target_bg
+        start_fg = self._pill_fg or target_fg
+        width_same = abs(start_w - target_w) < 3
+        color_same = _same_color(start_bg, target_bg) and _same_color(start_fg, target_fg)
+        moving = not (width_same and color_same)
+        self._pill_width = float(target_w) if width_same else start_w
+        self._pill_color = target_bg if color_same else start_bg
+        self._pill_fg = target_fg if color_same else start_fg
+        self._glow_boost = 1.15 if moving else 1.0
+        self._status_animating = moving
+        self._pill_anim = (start_w, float(target_w), start_bg, target_bg, start_fg, target_fg)
+        self._fit_signal()
+        if not moving:
+            self._draw_pill()
+            self._fade_glow(token, 0)
+            return
+        self._animate_pill(token, 0)
+
+    def _animate_pill(self, token: int, step: int) -> None:
+        if not self._alive or token != self._anim_token or not self._pill_anim:
+            return
+        start_w, target_w, start_bg, target_bg, start_fg, target_fg = self._pill_anim
+        steps = 12
+        done = step >= steps
+        t = _ease(step, steps)
+        if done:
+            self._pill_width = float(target_w)
+            self._pill_color = target_bg
+            self._pill_fg = target_fg
+            self._glow_boost = 0.0
+            self._status_animating = False
+        else:
+            self._pill_width = start_w + (target_w - start_w) * t
+            self._pill_color = _mix(start_bg, target_bg, t)
+            self._pill_fg = _mix(start_fg, target_fg, t)
+            self._glow_boost = (1.0 - t) * 1.15
+        try:
+            self._draw_pill()
+        except tk.TclError:
+            self._status_animating = False
+            return
+        if done:
+            return
+        try:
+            self.root.after(16, lambda token=token, step=step + 1: self._animate_pill(token, step))
+        except tk.TclError:
+            self._status_animating = False
+
+    def _fade_glow(self, token: int, step: int) -> None:
+        if not self._alive or token != self._anim_token:
+            return
+        steps = 8
+        self._glow_boost = 0.0 if step >= steps else 1.0 - step / float(steps)
+        try:
+            self._draw_pill()
+        except tk.TclError:
+            return
+        if step >= steps:
+            return
+        try:
+            self.root.after(22, lambda token=token, step=step + 1: self._fade_glow(token, step))
+        except tk.TclError:
+            pass
+
+    def _snap_pill(self) -> None:
+        spec = self._pill_spec()
+        if spec is None:
+            self._pill_dirty = True
+            return
+        self._pill_dirty = False
+        self._anim_token += 1
+        self._status_animating = False
+        self._glow_boost = 0.0
+        self._pill_width, self._pill_color, self._pill_fg = spec
+        self._fit_signal()
+        self._draw_pill()
+
+    def _on_signal_configure(self, event) -> None:
+        if event.width < 40 or self._fitting:
+            return
+        if self._status_animating:
+            self._draw_pill()
+            return
+        if self._pill_dirty:
+            self._play_status()
+            return
+        self._snap_pill()
+
+    def _pulse(self) -> None:
+        if not self._alive:
+            return
+        self._pulse_phase += 0.075
+        try:
+            if self._state in ("idle", "progress") and not self._status_animating and self._glow_boost <= 0.01:
+                self._draw_pill()
+            if self._link_state == "online":
+                theme = self._theme()
+                wave = 0.5 + 0.5 * math.sin(self._pulse_phase * 0.65)
+                self.dot.itemconfigure(self.dot_id, fill=_mix(theme["online"], "#ffffff", 0.16 * wave))
+            self.root.after(48, self._pulse)
+        except tk.TclError:
+            pass
+
+    def _button_size(self):
+        font = self.fonts["footer"]
+        width = max(176, font.measure("Отметить") + 68)
+        height = max(44, font.metrics("linespace") + 20)
+        return int(width), int(height)
+
+    def _draw_action(self, _event=None) -> None:
+        if self._drawing_action:
+            return
+        self._drawing_action = True
+        try:
+            canvas = self.manual_button
+            theme = self._theme()
+            width, height = self._button_size()
+            if int(float(canvas.cget("width"))) != width or int(float(canvas.cget("height"))) != height:
+                canvas.configure(width=width, height=height)
+            canvas.configure(bg=theme["bg"])
+            canvas.delete("btn")
+            if self._button_pressed:
+                fill = _mix(theme["button_hover"], "#ffffff", 0.35)
+            elif self._button_hot:
+                fill = theme["button_hover"]
+            else:
+                fill = theme["button"]
+            self._capsule(canvas, 1, 1, width - 1, height - 1, fill, "btn")
+            canvas.create_text(
+                width / 2.0,
+                height / 2.0,
+                text="Отметить",
+                fill=theme["button_text"],
+                font=self.fonts["footer"],
+                tags="btn",
+            )
+        except tk.TclError:
+            pass
+        finally:
+            self._drawing_action = False
+
+    def _button_press(self, _event=None):
+        self._button_pressed = True
+        self._button_press_token += 1
+        token = self._button_press_token
+        self._draw_action()
+        try:
+            self.root.after(130, lambda token=token: self._release_button(token))
+        except tk.TclError:
+            self._button_pressed = False
+        return self._submit_manual()
+
+    def _release_button(self, token: int) -> None:
+        if token != self._button_press_token or not self._alive:
+            return
+        self._button_pressed = False
+        self._draw_action()
+
+    def _button_enter(self, _event=None) -> None:
+        self._button_hot = True
+        self._draw_action()
+
+    def _button_leave(self, _event=None) -> None:
+        self._button_hot = False
+        self._draw_action()
+
+    def _draw_banner(self, _event=None) -> None:
+        if self._banner_fit or not getattr(self, "banner_canvas", None):
+            return
+        text = self._banner_text or ""
+        canvas = self.banner_canvas
+        theme = self._theme()
+        page = theme["bg"]
+        try:
+            width = int(canvas.winfo_width())
+            height = int(canvas.winfo_height())
+        except tk.TclError:
+            return
+        if width < 40:
+            return
+        canvas.configure(bg=page)
+        self.banner.configure(bg=page)
+        canvas.delete("banner")
+        if not text:
+            return
+        font = self.fonts["small"]
+        inner = max(180, width - 96)
+        lines = _wrap_lines(text, font, inner)
+        line_h = max(font.metrics("linespace"), 12)
+        pill_h = line_h * len(lines) + 18
+        target = int(pill_h + 10)
+        if abs(int(float(canvas.cget("height"))) - target) > 2:
+            self._banner_fit = True
+            try:
+                canvas.configure(height=target)
+            finally:
+                self._banner_fit = False
+            height = target
+        y1 = max(2, (height - pill_h) / 2.0)
+        self._capsule(canvas, 4, y1, width - 4, y1 + pill_h, theme["banner_bg"], "banner")
+        canvas.create_text(
+            width / 2.0,
+            height / 2.0,
+            text=text,
+            fill=theme["banner_fg"],
+            font=font,
+            width=inner,
+            justify="center",
+            tags="banner",
+        )
+
+    def _paint_history_mark(self, event, color: str, line: str) -> None:
+        canvas = event.widget
+        item = canvas.master
+        children = item.master.winfo_children()
+        try:
+            index = children.index(item)
+        except ValueError:
+            index = 0
+        count = len(children)
+        height = event.height
+        canvas.delete("all")
+        if height < 4:
+            return
+        center = 8
+        top = 5
+        bottom = 15
+        if index > 0:
+            canvas.create_line(center, 0, center, top + 1, fill=line, width=1)
+        if index < count - 1:
+            canvas.create_line(center, bottom - 1, center, height, fill=line, width=1)
+        canvas.create_oval(center - 5, top, center + 5, bottom, fill=color, outline="")
+
+    def _paint_panel(self, state: str) -> None:
+        del state
+        theme = self._theme()
+        page = theme["bg"]
+        stamp = (self.settings["ui"].get("theme"), page, theme["text"], theme["muted"], theme["accent"], theme["line"])
+        if stamp == self._panel_stamp:
+            return
+        self._panel_stamp = stamp
+        self.body.configure(bg=page)
+        self.stage.configure(bg=page)
+        self.rail.configure(bg=page)
+        self.rail_edge.configure(bg=theme["line"])
+        self.rail_rule.configure(bg=theme["line"])
+        self.clock_label.configure(bg=page, fg=theme["accent"])
+        self.date_label.configure(bg=page, fg=theme["muted"])
+        self.history_title.configure(bg=page, fg=theme["muted"])
+        self.history_rows.configure(bg=page)
+        self.signal.configure(bg=page)
+        self.copy.configure(bg=page)
+        self.copy_top.configure(bg=page)
+        self.copy_bottom.configure(bg=page)
+        self.copy_kicker.configure(bg=page, fg=theme["accent"])
+        self.name_label.configure(bg=page, fg=theme["text"])
+        self.when_label.configure(bg=page, fg=theme["text"])
         for widget in (self.badge_label, self.detail_label):
-            widget.configure(bg=copy_bg, fg=theme["muted"])
+            widget.configure(bg=page, fg=theme["muted"])
 
     def _render_history(self) -> None:
+        if not self._alive:
+            return
         theme = self._theme()
         rows = self.db.recent_events(self._history_limit())
         now = datetime.now().astimezone()
@@ -583,33 +1122,28 @@ class KioskApp:
         if key == self._history_key:
             return
         self._history_key = key
+        self._history_fade_token += 1
         for child in self.history_rows.winfo_children():
             child.destroy()
-        self.history_head.pack_forget()
-        self.history_head_rule.pack_forget()
+        bg = theme["bg"]
         if not rows:
-            empty = tk.Frame(self.history_rows, bg=theme["bg"])
-            empty.pack(fill="x")
+            self._history_motion = ("empty",)
             tk.Label(
-                empty,
+                self.history_rows,
                 text="Пока нет отметок",
                 anchor="w",
+                justify="left",
                 font=self.fonts["history"],
-                bg=theme["bg"],
+                bg=bg,
                 fg=theme["muted"],
-            ).pack(fill="x", pady=8)
+                wraplength=230,
+            ).pack(anchor="w", fill="x", padx=8, pady=4)
             return
-        self.history_head.pack(fill="x", before=self.history_rows)
-        self.history_head_rule.pack(fill="x", before=self.history_rows)
+        lead_sig = (rows[0]["id"], rows[0]["status"], rows[0]["event_type"])
+        animate_lead = self._history_motion is not None and lead_sig != self._history_motion
+        self._history_motion = lead_sig
+        lead_item = None
         for index, row in enumerate(rows):
-            bg = theme["bg"]
-            line = tk.Frame(self.history_rows, bg=bg)
-            line.pack(fill="x")
-            line.columnconfigure(0, minsize=4)
-            line.columnconfigure(1, minsize=150)
-            line.columnconfigure(2, weight=1)
-            line.columnconfigure(3, minsize=120)
-            line.columnconfigure(4, minsize=130)
             moment = parse_iso(row["scanned_at"]) or now
             event_name = EVENT_TEXT.get(row["event_type"], row["event_type"])
             status_name = STATUS_TEXT.get(row["status"], row["status"])
@@ -622,28 +1156,158 @@ class KioskApp:
             elif row["status"] == "rejected":
                 status_color = theme["error_text"]
             elif row["status"] == "sent":
-                status_color = theme["in_text"]
-            mark = tk.Frame(line, bg=event_color, width=4, bd=0, highlightthickness=0)
-            mark.grid(row=0, column=0, sticky="ns")
-            cells = (
-                (1, format_history_time(moment, now), theme["muted"], "w"),
-                (2, row.get("name") or row["badge"], theme["text"], "w"),
-                (3, event_name, event_color, "w"),
-                (4, status_name, status_color, "e"),
+                status_color = theme["muted"]
+            item = tk.Frame(self.history_rows, bg=bg)
+            item.pack(fill="x", pady=0)
+            if index == 0:
+                lead_item = item
+            mark = tk.Canvas(item, width=16, height=18, highlightthickness=0, bd=0, bg=bg)
+            mark.mark_color = event_color
+            mark.mark_line = theme["line"]
+            mark.bind(
+                "<Configure>",
+                lambda event, canvas=mark: self._paint_history_mark(
+                    event,
+                    getattr(canvas, "mark_color", "") or "",
+                    getattr(canvas, "mark_line", "") or "",
+                ),
             )
-            for column, text, color, anchor in cells:
+            mark.pack(side="left", anchor="n", fill="y", padx=(2, 8))
+            text = tk.Frame(item, bg=bg)
+            text.pack(side="left", fill="x", expand=True)
+            top = tk.Frame(text, bg=bg)
+            top.pack(fill="x")
+            tk.Label(
+                top,
+                text=format_history_time(moment, now),
+                anchor="w",
+                font=self.fonts["kicker"],
+                bg=bg,
+                fg=theme["muted"],
+            ).pack(side="left")
+            tk.Label(
+                top,
+                text=event_name,
+                anchor="e",
+                font=self.fonts["kicker"],
+                bg=bg,
+                fg=event_color,
+            ).pack(side="right")
+            tk.Label(
+                text,
+                text=row.get("name") or row["badge"],
+                anchor="w",
+                justify="left",
+                font=self.fonts["history"],
+                bg=bg,
+                fg=theme["text"],
+                wraplength=246,
+            ).pack(anchor="w", fill="x", pady=(2, 0 if row["status"] != "sent" else 8))
+            if row["status"] != "sent":
                 tk.Label(
-                    line,
-                    text=text,
-                    anchor=anchor,
-                    font=self.fonts["history"],
+                    text,
+                    text=status_name,
+                    anchor="w",
+                    font=self.fonts["kicker"],
                     bg=bg,
-                    fg=color,
-                ).grid(row=0, column=column, sticky="ew", padx=(14 if column == 1 else 8, 18 if column == 4 else 8), pady=5)
-            if index < len(rows) - 1:
-                rule = tk.Frame(self.history_rows, bg=theme["line"], height=1, bd=0, highlightthickness=0)
-                rule.pack_propagate(False)
-                rule.pack(fill="x")
+                    fg=status_color,
+                ).pack(anchor="w", pady=(0, 8))
+        self.history_rows.update_idletasks()
+        self._trim_history()
+        if animate_lead and lead_item is not None:
+            try:
+                if lead_item.winfo_exists():
+                    self._fade_history_lead(lead_item)
+            except tk.TclError:
+                pass
+
+    def _fade_history_lead(self, item) -> None:
+        """Проявить только верхнюю, новую строку истории."""
+        page = self._theme()["bg"]
+        labels = []
+        mark = None
+        mark_color = ""
+        stack = [item]
+        while stack:
+            widget = stack.pop()
+            try:
+                stack.extend(widget.winfo_children())
+            except tk.TclError:
+                continue
+            if isinstance(widget, tk.Label):
+                color = str(widget.cget("fg"))
+                labels.append((widget, color))
+                widget.configure(fg=page)
+            elif mark is None and isinstance(widget, tk.Canvas) and getattr(widget, "mark_color", ""):
+                mark = widget
+                mark_color = str(widget.mark_color)
+        self._history_fade_token += 1
+        token = self._history_fade_token
+        if mark is not None and mark_color:
+            mark.mark_color = page
+            self._paint_one_mark(mark, page)
+        self._history_fade_step(token, labels, mark, mark_color, page, 0)
+
+    def _history_fade_step(self, token: int, labels, mark, mark_color: str, page: str, step: int) -> None:
+        if not self._alive or token != self._history_fade_token:
+            return
+        steps = 9
+        done = step >= steps
+        t = _ease(step, steps)
+        try:
+            for widget, color in labels:
+                widget.configure(fg=color if done else _mix(page, color, t))
+            if mark is not None and mark_color:
+                color = mark_color if done else _mix(page, mark_color, t)
+                mark.mark_color = color
+                self._paint_one_mark(mark, color)
+        except tk.TclError:
+            return
+        if done:
+            return
+        try:
+            self.root.after(
+                16,
+                lambda token=token, labels=labels, mark=mark, mark_color=mark_color, page=page, step=step + 1: self._history_fade_step(
+                    token, labels, mark, mark_color, page, step
+                ),
+            )
+        except tk.TclError:
+            pass
+
+    def _paint_one_mark(self, canvas, color: str) -> None:
+        line = getattr(canvas, "mark_line", "") or ""
+        try:
+            height = max(canvas.winfo_height(), canvas.master.winfo_height(), 18)
+        except tk.TclError:
+            return
+        event = type("MarkEvent", (), {"widget": canvas, "height": height})()
+        self._paint_history_mark(event, color, line)
+
+    def _trim_history(self) -> None:
+        """Убрать строки, которые уже не входят в колонку и иначе рисуются поверх первых."""
+        parent_h = self.history_rows.winfo_height()
+        if parent_h < 40:
+            return
+        used = 0
+        for child in list(self.history_rows.winfo_children()):
+            need = child.winfo_reqheight()
+            if used and used + need > parent_h + 1:
+                child.destroy()
+                continue
+            used += need
+        self._repaint_history_marks()
+
+    def _repaint_history_marks(self) -> None:
+        for item in self.history_rows.winfo_children():
+            for canvas in item.winfo_children():
+                color = getattr(canvas, "mark_color", "")
+                line = getattr(canvas, "mark_line", "")
+                if not color:
+                    continue
+                height = max(canvas.winfo_height(), item.winfo_height(), 18)
+                event = type("MarkEvent", (), {"widget": canvas, "height": height})()
+                self._paint_history_mark(event, color, line)
 
     def _set_pending(self, count: int) -> None:
         theme = self._theme()
@@ -694,14 +1358,19 @@ class KioskApp:
         if text == self._banner_text:
             return
         self._banner_text = text
-        theme = self._theme()
         if text:
-            self.banner_label.configure(text=text, bg=theme["banner_bg"], fg=theme["banner_fg"])
-            self.banner.configure(bg=theme["banner_bg"])
+            self.banner.configure(bg=self._theme()["bg"])
             if not self.banner.winfo_ismapped():
                 self.banner.grid()
+            self._draw_banner()
         elif self.banner.winfo_ismapped():
             self.banner.grid_remove()
+        self._history_key = None
+        if self._alive:
+            try:
+                self.root.after_idle(self._render_history)
+            except tk.TclError:
+                pass
 
     def _paint_voice_warning(self) -> None:
         if not self._alive:
@@ -790,13 +1459,9 @@ class KioskApp:
             return
         self._configured_size = size
         scale = self._compute_scale(event.height)
-        inner = max(520, event.width - 64)
-        signal_w = max(280, int(inner * 4 / 12))
-        copy_w = max(220, inner - signal_w - 16)
-        self.status_label.configure(wraplength=max(180, signal_w - 56))
-        self.name_label.configure(wraplength=max(180, copy_w - 72))
-        self.detail_label.configure(wraplength=max(180, copy_w - 72))
-        self.banner_label.configure(wraplength=max(400, event.width - 96))
+        stage_w = max(320, event.width - 360)
+        self.name_label.configure(wraplength=max(220, stage_w - 48))
+        self.detail_label.configure(wraplength=max(220, min(680, stage_w - 80)))
         if abs(scale - self._scale) >= 0.04:
             self._scale = scale
             self._apply_fonts()
@@ -804,13 +1469,15 @@ class KioskApp:
         if limit != self._shown_history:
             self._shown_history = limit
             self._render_history()
+        else:
+            self._trim_history()
 
     def _history_limit(self) -> int:
         height = self.root.winfo_height()
-        if height < 820:
-            return 3
-        if height < 980:
-            return 5
+        if height < 640:
+            return 4
+        if height < 900:
+            return 6
         return 8
 
     def _compute_scale(self, height: int) -> float:
@@ -821,80 +1488,74 @@ class KioskApp:
     def _apply_fonts(self) -> None:
         for name, base in FONT_BASE.items():
             self.fonts[name].configure(size=max(10, int(base * self._scale)))
+        self._draw_brand()
+        self._draw_action()
+        self._snap_pill()
+        if self._banner_text:
+            self._draw_banner()
 
     def _apply_colors(self) -> None:
         theme = self._theme()
+        self._reveal_token += 1
+        self._reveal_key = None
+        self._history_fade_token += 1
+        self._panel_stamp = None
         self.root.configure(bg=theme["bg"])
-        frames = (self.history, self.center_wrap)
-        for frame in frames:
-            frame.configure(bg=theme["bg"])
+        self.body.configure(bg=theme["bg"])
         self.header.configure(bg=theme["header"])
         self.brand.configure(bg=theme["header"])
-        self.brand_mark.configure(bg=theme["accent"])
+        self.brand_mark.configure(bg=theme["accent2"])
         self.status_row.configure(bg=theme["header"])
         self.footer.configure(bg=theme["bg"])
-        self.action_row.configure(
-            bg=theme["card"],
-            highlightbackground=theme["line"],
-            highlightcolor=theme["line"],
-        )
+        self.action_row.configure(bg=theme["bg"], highlightthickness=0)
         self.meta_row.configure(bg=theme["bg"])
         self.header_rule.configure(bg=theme["line"])
         self.footer_rule.configure(bg=theme["line"])
+        self.banner.configure(bg=theme["bg"])
         self.dot.configure(bg=theme["header"])
-        header_labels = (self.title_label, self.device_label, self.clock_label, self.date_label, self.link_label)
-        for label in header_labels:
+        self._draw_brand()
+        for label in (self.title_label, self.device_label, self.link_label):
             label.configure(bg=theme["header"], fg=theme["text"])
         self.device_label.configure(fg=theme["muted"])
-        self.date_label.configure(fg=theme["muted"])
         self.link_label.configure(fg=theme["muted"])
-        self.history.configure(bg=theme["bg"])
-        self.history_title.configure(bg=theme["bg"], fg=theme["muted"])
-        self.history_card.configure(bg=theme["bg"], highlightthickness=0)
-        self.history_head.configure(bg=theme["bg"])
-        self.history_head_rule.configure(bg=theme["line"])
-        for label in self._history_headers:
-            label.configure(bg=theme["bg"], fg=theme["muted"])
-        self.history_rows.configure(bg=theme["bg"])
         self.footer.configure(bg=theme["bg"])
         self.hint_label.configure(bg=theme["bg"], fg=theme["muted"])
         self.pending_label.configure(bg=theme["bg"])
         self.voice_label.configure(bg=theme["bg"], fg=theme["warn_text"])
         self.version_label.configure(bg=theme["bg"], fg=theme["muted"])
-        self.manual_label.configure(bg=theme["card"], fg=theme["text"])
+        self.manual_label.configure(bg=theme["bg"], fg=theme["muted"])
         self.manual_entry.configure(
             bg=theme["entry"],
             fg=theme["text"],
-            insertbackground=theme["text"],
+            insertbackground=theme["accent"],
             highlightbackground=theme["line"],
             highlightcolor=theme["accent"],
-        )
-        self.manual_button.configure(
-            bg=theme["button"],
-            fg=theme["button_text"],
-            activebackground=theme["button_hover"],
-            activeforeground=theme["button_text"],
-            highlightthickness=0,
-        )
-        self.admin_button.configure(
-            bg=theme["card"],
-            fg=theme["text"],
-            activebackground=theme["row"],
-            activeforeground=theme["text"],
             highlightthickness=1,
-            highlightbackground=theme["line"],
-            highlightcolor=theme["line"],
+            bd=0,
+        )
+        self._draw_action()
+        self.admin_button.configure(
+            bg=theme["bg"],
+            fg=theme["accent"],
+            activebackground=theme["bg"],
+            activeforeground=theme["button_hover"],
+            highlightthickness=0,
+            bd=0,
         )
         device = str(self.settings["server"].get("device_id") or "")
         self.device_label.configure(text=device)
         self._paint_panel(self._state)
+        self._snap_pill()
         self._banner_text = None
         self._layout_language = None
         self._history_key = None
         self._paint_layout()
+        self._render_history()
         self._set_online(self._link_state)
 
     def _font_family(self, name: str) -> str:
+        if name in MONO_FONTS:
+            return self.mono
         if name in BOLD_FONTS:
             return self.serif_bold
         if name in SERIF_FONTS:

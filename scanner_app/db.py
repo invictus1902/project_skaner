@@ -7,13 +7,54 @@ from datetime import datetime
 from pathlib import Path
 
 
+class _QuietCursor:
+    """Пустой ответ вместо ошибки, если базу уже закрыли из другого потока."""
+
+    rowcount = 0
+    lastrowid = 0
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+
+class _QuietConnection:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+        self.closed = False
+
+    def execute(self, *args, **kwargs):
+        if self.closed:
+            return _QuietCursor()
+        return self._connection.execute(*args, **kwargs)
+
+    def executescript(self, script: str):
+        if self.closed:
+            return _QuietCursor()
+        return self._connection.executescript(script)
+
+    def commit(self) -> None:
+        if self.closed:
+            return
+        self._connection.commit()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self._connection.close()
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        raw = sqlite3.connect(str(self.path), check_same_thread=False)
+        raw.row_factory = sqlite3.Row
+        self._conn = _QuietConnection(raw)
         self._init()
 
     def _init(self) -> None:

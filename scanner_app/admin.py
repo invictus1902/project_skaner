@@ -29,6 +29,7 @@ from scanner_app.ui_helpers import (
     ScrollFrame,
     center_over,
     ensure_independent,
+    pack_mark,
     place_window,
     present_window,
     widget_alive,
@@ -141,9 +142,7 @@ class LoginDialog(tk.Toplevel):
         self.configure(bg=theme["bg"])
         self.attributes("-topmost", True)
         tk.Label(self, text=title, bg=theme["bg"], fg=theme["text"], font=(serif, 26)).pack(padx=28, pady=(24, 8))
-        mark = tk.Frame(self, bg=theme["accent"], height=2, width=36, bd=0, highlightthickness=0)
-        mark.pack_propagate(False)
-        mark.pack(pady=(0, 14))
+        pack_mark(self, theme, pady=(0, 14))
         tk.Label(self, text="Пароль настроек на этом компьютере", bg=theme["bg"], fg=theme["muted"], font=(sans, 11)).pack(padx=28, anchor="w")
         tk.Label(
             self,
@@ -314,9 +313,7 @@ class AdminWindow(tk.Toplevel):
         head = tk.Frame(self, bg=theme["bg"])
         head.pack(fill="x", padx=18, pady=(14, 2))
         tk.Label(head, text="Настройки", bg=theme["bg"], fg=theme["text"], font=(self.serif, 28)).pack(anchor="w")
-        mark = tk.Frame(head, bg=theme["accent"], height=2, width=36, bd=0, highlightthickness=0)
-        mark.pack_propagate(False)
-        mark.pack(anchor="w", pady=(10, 0))
+        pack_mark(head, theme, anchor="w", pady=(10, 0))
         tk.Label(
             head,
             text="Это окно сворачивается отдельно: экран отметок остаётся на месте. F12 открывает настройки снова.",

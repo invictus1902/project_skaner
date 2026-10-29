@@ -900,6 +900,11 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(db.get_event(duplicate)["status"], "rejected")
             self.assertEqual(db.get_event(held)["status"], "sending")
             db.close()
+            self.assertEqual(db.recent_events(), [])
+            self.assertEqual(db.count_pending(), 0)
+            self.assertIsNone(db.get_event(held))
+            self.assertFalse(db.claim_event(held))
+            self.assertEqual(db.insert_event("10", "Иван", "in", moment, {"badge": "10"}), 0)
             reopened = Database(Path(folder) / "t.db")
             try:
                 self.assertEqual(reopened.get_event(held)["status"], "pending")

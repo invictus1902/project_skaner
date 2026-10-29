@@ -58,6 +58,19 @@ def work_area(anchor=None) -> tuple:
     return 0, 0, 1280, 720
 
 
+def pack_mark(parent, theme: dict, anchor: str = "center", pady=(0, 0)) -> tk.Frame:
+    """Короткая метка: пурпурная точка и линия акцента."""
+    row = tk.Frame(parent, bg=theme["bg"], bd=0, highlightthickness=0)
+    hot = tk.Frame(row, bg=theme.get("accent2") or theme["accent"], width=8, height=8, bd=0, highlightthickness=0)
+    hot.pack_propagate(False)
+    hot.pack(side="left", padx=(0, 8))
+    line = tk.Frame(row, bg=theme["accent"], height=2, width=42, bd=0, highlightthickness=0)
+    line.pack_propagate(False)
+    line.pack(side="left")
+    row.pack(anchor=anchor, pady=pady)
+    return row
+
+
 def place_window(
     window,
     width: int,

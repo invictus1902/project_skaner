@@ -20,7 +20,7 @@ from scanner_app.shifts import (
     sessions_for_user,
 )
 from scanner_app.theme import apply_ttk_style, theme_by_name
-from scanner_app.ui_helpers import center_over, ensure_independent, place_window, present_window
+from scanner_app.ui_helpers import center_over, ensure_independent, pack_mark, place_window, present_window
 
 
 class ShiftsWindow(tk.Toplevel):
@@ -64,9 +64,7 @@ class ShiftsWindow(tk.Toplevel):
         top = ttk.Frame(self)
         top.pack(fill="x", padx=20, pady=(16, 4))
         tk.Label(top, text="Смены", bg=self._theme["bg"], fg=self._theme["text"], font=(self.serif, 28)).pack(anchor="w")
-        mark = tk.Frame(top, bg=self._theme["accent"], height=2, width=36, bd=0, highlightthickness=0)
-        mark.pack_propagate(False)
-        mark.pack(anchor="w", pady=(8, 0))
+        pack_mark(top, self._theme, anchor="w", pady=(8, 0))
         ttk.Label(
             top,
             text="Окно сворачивается отдельно от остальных. Esc — закрыть.",
