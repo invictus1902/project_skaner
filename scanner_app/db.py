@@ -102,6 +102,7 @@ class Database:
             )
             # После сбоя программа могла остаться на середине отправки.
             self._conn.execute("UPDATE events SET status = 'pending' WHERE status = 'sending'")
+            self._conn.execute("UPDATE session_ops SET status = 'pending' WHERE status = 'sending'")
             self._conn.commit()
 
     def close(self) -> None:
@@ -169,17 +170,33 @@ class Database:
             self._conn.commit()
             return int(cursor.lastrowid)
 
-    def mark_sent(self, event_id: int, name: str, event_type: str) -> None:
+    def mark_sent(
+        self,
+        event_id: int,
+        name: str,
+        event_type: str,
+        scanned_at: datetime | None = None,
+    ) -> None:
         sent_at = datetime.now().astimezone().isoformat(timespec="seconds")
         with self._lock:
-            self._conn.execute(
-                """
-                UPDATE events
-                SET status='sent', sent_at=?, error=NULL, name=?, event_type=?
-                WHERE id=?
-                """,
-                (sent_at, name, event_type, event_id),
-            )
+            if scanned_at is None:
+                self._conn.execute(
+                    """
+                    UPDATE events
+                    SET status='sent', sent_at=?, error=NULL, name=?, event_type=?
+                    WHERE id=?
+                    """,
+                    (sent_at, name, event_type, event_id),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE events
+                    SET status='sent', sent_at=?, error=NULL, name=?, event_type=?, scanned_at=?
+                    WHERE id=?
+                    """,
+                    (sent_at, name, event_type, scanned_at.isoformat(timespec="seconds"), event_id),
+                )
             self._conn.commit()
 
     def mark_rejected(self, event_id: int, error: str) -> None:
@@ -197,6 +214,16 @@ class Database:
                 (error[:500], event_id),
             )
             self._conn.commit()
+
+    def claim_session_op(self, op_id: int) -> bool:
+        """Занять правку смены перед отправкой, чтобы её не создали дважды."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE session_ops SET status = 'sending' WHERE id = ? AND status = 'pending'",
+                (int(op_id),),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def claim_event(self, event_id: int) -> bool:
         """Занять отметку перед отправкой, чтобы её не послали второй раз."""

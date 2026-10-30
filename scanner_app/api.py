@@ -14,7 +14,7 @@ from urllib.parse import quote
 from scanner_app.config import LOCAL_API_URL, server_urls
 from scanner_app.logging_setup import logger
 from scanner_app.logic import parse_iso
-from scanner_app.shifts import duration_minutes, is_open, normalize_clock, normalize_date
+from scanner_app.shifts import duration_minutes, is_open, keep_shift_span, normalize_clock, normalize_date
 
 UNKNOWN_CODES = {
     "unknown_badge",
@@ -60,6 +60,68 @@ def extract_name(data) -> str:
     if isinstance(employee, dict):
         return extract_name(employee)
     return ""
+
+
+def _hm(value) -> str:
+    clock = normalize_clock(str(value or ""))
+    return clock[:5] if clock else ""
+
+
+def _clock_on(day, clock: str, fallback: datetime) -> datetime | None:
+    """Собрать дату и часы ответа в один момент. Часовой пояс берётся у скана."""
+    normal = normalize_clock(str(clock or ""))
+    if not normal:
+        return None
+    date_text = normalize_date(str(day or "")) or fallback.strftime("%Y-%m-%d")
+    try:
+        parsed = datetime.strptime(date_text + "T" + normal, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    if fallback.tzinfo is not None:
+        return parsed.replace(tzinfo=fallback.tzinfo)
+    return parsed
+
+
+def _stamp_mark(data: dict, kind: str, moment: datetime) -> None:
+    data["event"] = kind
+    data["mark_time"] = moment.isoformat(timespec="seconds")
+
+
+def server_mark(data, fallback_event: str, fallback_moment: datetime) -> tuple[str, datetime]:
+    """Тип и время отметки из ответа сервера. Повтор открытой смены — не новый приход."""
+    if not isinstance(data, dict):
+        kind = fallback_event if fallback_event in ("in", "out", "repeat") else "in"
+        return kind, fallback_moment
+    aliases = {
+        "repeat": "repeat",
+        "already": "repeat",
+        "duplicate": "repeat",
+        "повтор": "repeat",
+        "start": "in",
+        "in": "in",
+        "arrival": "in",
+        "приход": "in",
+        "end": "out",
+        "out": "out",
+        "departure": "out",
+        "уход": "out",
+    }
+    if data.get("alreadyWorking") is True or data.get("already") is True:
+        kind = "repeat"
+    else:
+        event_field = str(data.get("event") or "").strip().lower()
+        action_field = str(data.get("action") or "").strip().lower()
+        kind = aliases.get(event_field) or aliases.get(action_field) or extract_event(data) or ""
+    if kind not in ("in", "out", "repeat"):
+        kind = fallback_event if fallback_event in ("in", "out", "repeat") else "in"
+    stamped = parse_iso(str(data.get("mark_time") or ""))
+    if stamped is not None:
+        if stamped.tzinfo is None and fallback_moment.tzinfo is not None:
+            stamped = stamped.replace(tzinfo=fallback_moment.tzinfo)
+        return kind, stamped
+    clock = _hm(data.get("startTime") if kind in ("in", "repeat") else data.get("endTime"))
+    combined = _clock_on(data.get("date"), clock, fallback_moment) if clock else None
+    return kind, combined or fallback_moment
 
 
 def extract_event(data) -> str:
@@ -227,6 +289,16 @@ def _session_started(session: dict, moment: datetime) -> datetime | None:
     return parsed
 
 
+def _recorded_minutes(start_date: str, start_time: str, end_date: str, end_time: str) -> int | None:
+    """Минуты закрытия. Повтор в ту же минуту не должен оставлять смену на ноль."""
+    minutes = duration_minutes(start_date, start_time, end_date, end_time)
+    if minutes is None:
+        return None
+    if minutes <= 0:
+        return 1
+    return minutes
+
+
 def _shift_is_stale(session: dict, moment: datetime, max_hours: float) -> bool:
     """Смена открыта дольше окна: это уже не текущий рабочий день."""
     started = _session_started(session, moment)
@@ -284,8 +356,15 @@ class ApiClient:
         self._cache_lock = threading.Lock()
         self._users_cache: tuple | None = None
         self._sessions_cache: tuple | None = None
+        # Поколение списка смен. Запись во время долгой загрузки делает ответ устаревшим.
+        self._sessions_epoch = 0
+        # Смены, записанные только что. Старый ответ сервера не должен их затирать.
+        self._held_sessions: dict = {}
         self._wall_until = 0.0
         self._cached_server = self._server_key()
+        # Один и тот же список не скачивается двумя потоками сразу.
+        self._flight_lock = threading.Lock()
+        self._flights: dict[str, threading.Event] = {}
 
     def update(self, settings: dict) -> None:
         """Новые настройки. Справочник сбрасывается только если сменился сервер."""
@@ -318,15 +397,62 @@ class ApiClient:
                 return None
             return copy.deepcopy(slot[1])
 
-    def _cache_put(self, kind: str, rows: list, identity: tuple) -> None:
+    def _cache_put(self, kind: str, rows: list, identity: tuple, epoch: int | None = None) -> bool:
         with self._cache_lock:
             if identity != self._cached_server:
-                return
+                return False
+            # Скачивание началось раньше, чем смена записалась. Старый список её сотрёт.
+            if kind == "sessions" and epoch is not None and epoch != self._sessions_epoch:
+                return False
             stored = copy.deepcopy(rows)
             if kind == "users":
                 self._users_cache = (time.monotonic(), stored, _badge_indexes(stored))
             else:
+                stored = self._apply_held_locked(stored)
                 self._sessions_cache = (time.monotonic(), stored, _open_index(stored))
+            return True
+
+    def _hold_locked(self, row: dict) -> None:
+        session_id = str(row.get("id") or "").strip()
+        if not session_id:
+            return
+        self._held_sessions[session_id] = (time.monotonic(), copy.deepcopy(row))
+
+    def _apply_held_locked(self, rows: list) -> list:
+        now = time.monotonic()
+        expired = [
+            session_id
+            for session_id, (saved_at, _row) in self._held_sessions.items()
+            if now - saved_at > DIRECTORY_CACHE_SEC
+        ]
+        for session_id in expired:
+            self._held_sessions.pop(session_id, None)
+        merged = [row for row in rows if isinstance(row, dict)]
+        for session_id, (_saved_at, row) in self._held_sessions.items():
+            updated = []
+            found = False
+            for item in merged:
+                if str(item.get("id") or "") == session_id:
+                    updated.append(copy.deepcopy(row))
+                    found = True
+                else:
+                    updated.append(item)
+            if not found:
+                updated.append(copy.deepcopy(row))
+            merged = updated
+        return merged
+
+    def _prefer_fresh_sessions(self, result: HttpResult) -> HttpResult:
+        """Если за время загрузки смену уже записали, наружу отдаём свежую память, а не старый ответ."""
+        if not isinstance(getattr(result, "data", None), list):
+            return result
+        cached = self._cache_get("sessions")
+        if cached is not None:
+            result.data = cached
+            return result
+        with self._cache_lock:
+            result.data = self._apply_held_locked(result.data)
+        return result
 
     def _skip_express(self) -> bool:
         """Хостинг уже ответил стеной Vercel: пока не стучаться в него на каждого человека."""
@@ -341,6 +467,14 @@ class ApiClient:
         with self._cache_lock:
             self._wall_until = time.monotonic() + CLOSED_HOST_SEC
 
+    def open_shift_count(self) -> int | None:
+        """Сколько сотрудников с открытой сменой уже лежит в памяти. Сеть не вызывается."""
+        with self._cache_lock:
+            slot = self._sessions_cache
+            if slot is None or len(slot) < 3 or not isinstance(slot[2], dict):
+                return None
+            return sum(1 for key in slot[2] if str(key).strip())
+
     def _cache_alive(self, kind: str) -> bool:
         with self._cache_lock:
             slot = self._users_cache if kind == "users" else self._sessions_cache
@@ -351,6 +485,68 @@ class ApiClient:
     def _drop_sessions(self) -> None:
         with self._cache_lock:
             self._sessions_cache = None
+            self._sessions_epoch += 1
+            self._held_sessions.clear()
+
+    def _peek_sessions(self) -> tuple[float, list] | None:
+        with self._cache_lock:
+            slot = self._sessions_cache
+            if slot is None:
+                return None
+            return slot[0], copy.deepcopy(slot[1])
+
+    def _restore_sessions(self, peeked: tuple[float, list] | None, only_if_held: bool = False) -> None:
+        """Вернуть список смен, если сервер его не изменил или строка уже вписана в память.
+
+        Полное скачивание перед следующим сканом держит экран. Срок жизни списка не продлевается.
+        """
+        if not peeked:
+            return
+        saved_at, rows = peeked
+        with self._cache_lock:
+            if self._sessions_cache is not None:
+                return
+            if only_if_held and not self._held_sessions:
+                return
+            if time.monotonic() - saved_at > DIRECTORY_CACHE_SEC:
+                return
+            merged = self._apply_held_locked(rows)
+            self._sessions_cache = (saved_at, merged, _open_index(merged))
+
+    def _join_flight(self, key: str) -> tuple[bool, threading.Event]:
+        with self._flight_lock:
+            current = self._flights.get(key)
+            if current is not None and not current.is_set():
+                return False, current
+            event = threading.Event()
+            self._flights[key] = event
+            return True, event
+
+    def _finish_flight(self, key: str, event: threading.Event) -> None:
+        event.set()
+        with self._flight_lock:
+            if self._flights.get(key) is event:
+                self._flights.pop(key, None)
+
+    def _load_shared(self, key: str, kind: str, loader) -> HttpResult:
+        """Второй поток ждёт уже идущую загрузку и берёт её из памяти."""
+        leader, event = self._join_flight(key)
+        if not leader:
+            event.wait()
+            cached = self._cache_get(kind)
+            if cached is not None:
+                return HttpResult(True, 200, cached, None, False)
+            leader, event = self._join_flight(key)
+            if not leader:
+                event.wait()
+                cached = self._cache_get(kind)
+                if cached is not None:
+                    return HttpResult(True, 200, cached, None, False)
+                return loader()
+        try:
+            return loader()
+        finally:
+            self._finish_flight(key, event)
 
     @property
     def is_site(self) -> bool:
@@ -455,6 +651,9 @@ class ApiClient:
             cached = self._cache_get("users")
             if cached is not None:
                 return HttpResult(True, 200, cached, None, False)
+        return self._load_shared("users", "users", self._fetch_users)
+
+    def _fetch_users(self) -> HttpResult:
         identity = self._server_key()
         users = None
         if not self._skip_express():
@@ -476,6 +675,11 @@ class ApiClient:
             cached = self._cache_get("sessions")
             if cached is not None:
                 return HttpResult(True, 200, cached, None, False)
+        with self._cache_lock:
+            epoch = self._sessions_epoch
+        return self._load_shared(f"sessions:{epoch}", "sessions", lambda epoch=epoch: self._fetch_sessions(epoch))
+
+    def _fetch_sessions(self, epoch: int) -> HttpResult:
         identity = self._server_key()
         sessions = None
         if not self._skip_express():
@@ -484,8 +688,8 @@ class ApiClient:
             if isinstance(sessions.data, list) and not self._blocked(sessions):
                 sessions.data = [_without_secrets(row) for row in sessions.data]
                 sessions.raw_text = ""
-                self._cache_put("sessions", sessions.data, identity)
-                return sessions
+                self._cache_put("sessions", sessions.data, identity, epoch)
+                return self._prefer_fresh_sessions(sessions)
         hosted = self._supabase_get(
             "workSessions",
             "id,userId,date,startTime,endTime,durationMinutes,status,source,editedBy",
@@ -502,8 +706,8 @@ class ApiClient:
                 )
                 if isinstance(opened.data, list) and not self._blocked(opened):
                     hosted.data = _merge_by_id(hosted.data, opened.data)
-            self._cache_put("sessions", hosted.data, identity)
-            return hosted
+            self._cache_put("sessions", hosted.data, identity, epoch)
+            return self._prefer_fresh_sessions(hosted)
         if sessions is not None:
             return sessions
         return HttpResult(False, None, None, "Смены недоступны", True)
@@ -541,22 +745,23 @@ class ApiClient:
         op_name = str(op.get("op") or "")
         with self._cache_lock:
             slot = self._sessions_cache
-            if slot is None:
-                return
-            rows = copy.deepcopy(slot[1])
+            rows = [] if slot is None else copy.deepcopy(slot[1])
             if op_name == "create":
                 row = {key: value for key, value in payload.items() if str(key).lower() != "password"}
                 row.update({key: value for key, value in data.items() if str(key).lower() != "password"})
                 if not str(row.get("id") or "").strip():
                     return
+                keep_shift_span(row, payload)
                 rows = [item for item in rows if str(item.get("id")) != str(row.get("id"))]
                 rows.append(row)
+                self._hold_locked(row)
             else:
                 session_id = str(data.get("id") or op.get("session_id") or "").strip()
                 if not session_id:
                     return
                 found = False
                 updated = []
+                kept = None
                 for item in rows:
                     if str(item.get("id")) != session_id:
                         updated.append(item)
@@ -564,14 +769,23 @@ class ApiClient:
                     merged = dict(item)
                     merged.update({key: value for key, value in payload.items() if str(key).lower() != "password"})
                     merged.update({key: value for key, value in data.items() if str(key).lower() != "password"})
+                    keep_shift_span(merged, payload)
                     updated.append(merged)
+                    kept = merged
                     found = True
                 if not found:
-                    row = {key: value for key, value in payload.items() if str(key).lower() != "password"}
-                    row.update({key: value for key, value in data.items() if str(key).lower() != "password"})
-                    row["id"] = session_id
-                    updated.append(row)
+                    kept = {key: value for key, value in payload.items() if str(key).lower() != "password"}
+                    kept.update({key: value for key, value in data.items() if str(key).lower() != "password"})
+                    kept["id"] = session_id
+                    keep_shift_span(kept, payload)
+                    updated.append(kept)
                 rows = updated
+                if kept is not None:
+                    self._hold_locked(kept)
+            # Даже без готового списка загрузка, которая уже идёт, не должна его подменить.
+            self._sessions_epoch += 1
+            if slot is None:
+                return
             self._sessions_cache = (time.monotonic(), rows, _open_index(rows))
 
     def _express_write(self, op: dict) -> HttpResult:
@@ -756,11 +970,37 @@ class ApiClient:
             direct = self._write_checkin_shift(payload)
             if direct is not None:
                 return direct
+        opened_before = self._tracked_open_shift(payload)
+        # Приём сканера видит только status=active и не применяет предел 16 часов.
+        # Такую смену закрываем сами, а зависшую ещё и сменяем новой.
+        if self._checkin_bypasses_express(payload, opened_before):
+            direct = self._write_checkin_shift(payload, direct=True)
+            if direct is not None:
+                return direct
         express = self._express_checkin(payload)
         self._note_wall(express)
         if express.ok and not self._blocked(express) and not _checkin_failed(express):
-            # Приём сканера сам переключил смену и не вернул строку. Список смен нужно прочитать заново.
+            # Приём сканера ставит своё время. Новый приход подгоняем под скан.
+            # Повтор уже открытой смены не двигает её приход и не считается новым.
+            # Список не выбрасываем насовсем: иначе следующий скан ждёт скачивание до экрана.
+            peeked = self._peek_sessions()
             self._drop_sessions()
+            repeat_at = self._repeat_arrival(payload, express, opened_before)
+            if repeat_at is not None:
+                self._restore_sessions(peeked)
+                data = express.data if isinstance(express.data, dict) else {}
+                express.data = data
+                data["action"] = "repeat"
+                data["alreadyWorking"] = True
+                data["startTime"] = repeat_at.strftime("%H:%M")
+                data["date"] = repeat_at.strftime("%Y-%m-%d")
+                _stamp_mark(data, "repeat", repeat_at)
+                return express
+            try:
+                self._align_express_clock(payload, express, opened_before)
+            except Exception:
+                logger().exception("Не удалось записать время отметки в смену")
+            self._restore_sessions(peeked, only_if_held=True)
             return express
         if _checkin_unknown(express):
             return express
@@ -789,10 +1029,20 @@ class ApiClient:
                 result = self._request("POST", url, {"badgeId": badge}, bearer=token)
         return result
 
-    def _write_checkin_shift(self, payload: dict) -> HttpResult | None:
+    def _checkin_bypasses_express(self, payload: dict, opened: dict | None) -> bool:
+        """Прямая запись, если приём сканера эту смену не закроет как надо."""
+        if not isinstance(opened, dict):
+            return False
+        moment = _event_moment(payload.get("timestamp"))
+        if _shift_is_stale(opened, moment, self._shift_max_hours()):
+            return True
+        return str(opened.get("status") or "").strip().lower() != "active"
+
+    def _write_checkin_shift(self, payload: dict, direct: bool = False) -> HttpResult | None:
         """Та же запись смены, что сработала вчера из окна «Смены», если приём сканера закрыт."""
         if not all(self._hosted_database()):
-            return None
+            if not (direct and self.write_url()):
+                return None
         badge = str(payload.get("badge") or payload.get("badgeId") or "").strip()
         found, result = self._find_user(badge)
         if found is None and (result.network_error or self._blocked(result) or not isinstance(result.data, list)):
@@ -846,6 +1096,7 @@ class ApiClient:
             written.data["name"] = written.data["fullName"]
             written.data["action"] = "start" if event == "in" else "end"
             written.data["event"] = event
+            _stamp_mark(written.data, event, moment)
         return written
 
     def _shift_max_hours(self) -> float:
@@ -855,24 +1106,150 @@ class ApiClient:
             return 16.0
 
     def _close_shift_row(self, session: dict, moment: datetime) -> HttpResult:
-        minutes = duration_minutes(
+        end_day = moment.strftime("%Y-%m-%d")
+        end_clock = moment.strftime("%H:%M:%S")
+        minutes = _recorded_minutes(
             str(session.get("date") or ""),
             str(session.get("startTime") or ""),
-            moment.strftime("%Y-%m-%d"),
-            moment.strftime("%H:%M:%S"),
+            end_day,
+            end_clock,
         )
+        if minutes is None:
+            # Раньше сюда писался ноль. Повтор по сети тоже нельзя: отметка так и останется в очереди.
+            return HttpResult(
+                False,
+                422,
+                {"message": "Не удалось посчитать длительность смены."},
+                "Не удалось посчитать длительность смены.",
+                False,
+            )
         return self.write_session(
             {
                 "op": "update",
                 "session_id": str(session.get("id")),
                 "payload": {
-                    "endTime": moment.strftime("%H:%M:%S"),
-                    "durationMinutes": 0 if minutes is None else minutes,
+                    "endDate": end_day,
+                    "endTime": end_clock,
+                    "durationMinutes": minutes,
                     "status": "completed",
                     "source": "qr",
                 },
             }
         )
+
+    def _tracked_open_shift(self, payload: dict) -> dict | None:
+        """Открытая смена до отметки. Нужен её номер, чтобы потом записать время ухода."""
+        try:
+            badge = str(payload.get("badge") or payload.get("badgeId") or "").strip()
+            found, result = self._find_user(badge)
+            if not isinstance(found, dict) or result.network_error or self._blocked(result):
+                return None
+            opened, failure = self._open_for_user(found.get("id"))
+            if failure is not None or not isinstance(opened, dict):
+                return None
+            if not str(opened.get("id") or "").strip():
+                return None
+            return opened
+        except Exception:
+            logger().exception("Не удалось прочитать открытую смену перед отметкой")
+            return None
+
+    def _repeat_arrival(self, payload: dict, express: HttpResult, opened_before: dict | None) -> datetime | None:
+        """Уже открытая смена, которую этот скан не начал заново. None — это обычный приход или уход."""
+        if not isinstance(opened_before, dict):
+            return None
+        data = express.data if isinstance(express.data, dict) else {}
+        action = str(data.get("action") or "").strip().lower()
+        if action in ("end", "out"):
+            return None
+        scan = _event_moment(payload.get("timestamp"))
+        started = _session_started(opened_before, scan)
+        if started is None or _shift_is_stale(opened_before, scan, self._shift_max_hours()):
+            return None
+        same_minute = started.strftime("%H:%M") == scan.strftime("%H:%M") and started.date() == scan.date()
+        if same_minute:
+            return None
+        echoed = _hm(data.get("startTime"))
+        prior = started.strftime("%H:%M")
+        if echoed and echoed == prior:
+            return started
+        if action not in ("start", "in"):
+            return None
+        current = self._tracked_open_shift(payload)
+        if not isinstance(current, dict):
+            return None
+        if str(current.get("id") or "") != str(opened_before.get("id") or ""):
+            return None
+        current_start = _session_started(current, scan)
+        if current_start is None:
+            return None
+        if current_start.strftime("%H:%M") == scan.strftime("%H:%M") and current_start.date() == scan.date():
+            return None
+        return current_start
+
+    def _align_express_clock(self, payload: dict, express: HttpResult, opened_before: dict | None) -> None:
+        """Сервер отмечает своим временем. Новый приход и уход в смене остаются на часах скана."""
+        data = express.data if isinstance(express.data, dict) else {}
+        action = str(data.get("action") or "").strip().lower()
+        if action not in ("start", "end"):
+            return
+        moment = _event_moment(payload.get("timestamp"))
+        day = moment.strftime("%Y-%m-%d")
+        clock = moment.strftime("%H:%M:%S")
+        if action == "end":
+            session = opened_before if isinstance(opened_before, dict) else None
+            session_id = str((session or {}).get("id") or "").strip()
+            if not session_id:
+                return
+            minutes = _recorded_minutes(
+                str(session.get("date") or ""),
+                str(session.get("startTime") or ""),
+                day,
+                clock,
+            )
+            if minutes is None:
+                return
+            if str(session.get("endTime") or "") == clock and session.get("durationMinutes") == minutes:
+                _stamp_mark(data, "out", moment)
+                return
+            written = self.write_session(
+                {
+                    "op": "update",
+                    "session_id": session_id,
+                    "payload": {
+                        "endDate": day,
+                        "endTime": clock,
+                        "durationMinutes": minutes,
+                        "status": "completed",
+                        "source": "qr",
+                    },
+                }
+            )
+            if written is not None and written.ok:
+                _stamp_mark(data, "out", moment)
+            return
+        badge = str(payload.get("badge") or payload.get("badgeId") or "").strip()
+        found, result = self._find_user(badge)
+        if not isinstance(found, dict) or result.network_error or self._blocked(result):
+            return
+        sessions = self._directory_sessions(refresh=True)
+        if not isinstance(sessions.data, list):
+            return
+        opened = _open_session(sessions.data, found.get("id"))
+        if not isinstance(opened, dict) or not str(opened.get("id") or "").strip():
+            return
+        if str(opened.get("date") or "") == day and str(opened.get("startTime") or "") == clock:
+            _stamp_mark(data, "in", moment)
+            return
+        written = self.write_session(
+            {
+                "op": "update",
+                "session_id": str(opened.get("id")),
+                "payload": {"date": day, "startTime": clock, "source": "qr"},
+            }
+        )
+        if written is not None and written.ok:
+            _stamp_mark(data, "in", moment)
 
     def operator_profiles(self) -> tuple[list[dict], str]:
         """Профили, которыми можно отмечать смены. Пароли в список не входят."""

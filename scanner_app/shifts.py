@@ -84,6 +84,59 @@ def format_duration(minutes) -> str:
     return f"{mins} мин"
 
 
+def session_end_day(session: dict) -> str:
+    """День ухода. В базе нет endDate: ночь собирается из длительности."""
+    explicit = normalize_date(str(session.get("endDate") or ""))
+    if explicit:
+        return explicit
+    start_day = normalize_date(str(session.get("date") or ""))
+    if not start_day:
+        return ""
+    start_clock = normalize_clock(str(session.get("startTime") or ""))
+    end_clock = normalize_clock(str(session.get("endTime") or ""))
+    if start_clock and end_clock and session.get("durationMinutes") not in (None, ""):
+        try:
+            span = int(session.get("durationMinutes"))
+        except (TypeError, ValueError):
+            span = -1
+        if span >= 0:
+            start = datetime.strptime(start_day + "T" + start_clock, "%Y-%m-%dT%H:%M:%S")
+            arrived = start + timedelta(minutes=span)
+            if arrived.strftime("%H:%M") == end_clock[:5]:
+                return arrived.strftime("%Y-%m-%d")
+    if start_clock and end_clock and end_clock < start_clock:
+        nxt = datetime.strptime(start_day, "%Y-%m-%d") + timedelta(days=1)
+        return nxt.strftime("%Y-%m-%d")
+    return start_day
+
+
+def end_clock_label(session: dict) -> str:
+    """Часы ухода. Если день другой, рядом короткая дата."""
+    clock = clock_short(str(session.get("endTime") or ""))
+    if not clock:
+        return "—"
+    end_day = session_end_day(session)
+    start_day = normalize_date(str(session.get("date") or ""))
+    if not end_day or not start_day or end_day == start_day:
+        return clock
+    shown = format_date_ru(end_day)
+    if len(shown) == 10 and end_day[:4] == start_day[:4]:
+        shown = shown[:5]
+    return f"{shown} {clock}"
+
+
+def keep_shift_span(row: dict, payload: dict) -> None:
+    """Сервер не хранит endDate и может вернуть длительность внутри одного дня."""
+    if not isinstance(row, dict) or not isinstance(payload, dict):
+        return
+    end_day = normalize_date(str(payload.get("endDate") or ""))
+    if not end_day:
+        return
+    row["endDate"] = end_day
+    if payload.get("durationMinutes") is not None:
+        row["durationMinutes"] = payload.get("durationMinutes")
+
+
 def is_open(session: dict) -> bool:
     """Идущая смена: уход ещё не проставлен. Старые ответы без endTime смотрят на status."""
     if "endTime" in session:
@@ -313,7 +366,17 @@ class ShiftBook:
             return "rejected", "Запись очереди не найдена."
         if op.get("status") == "sent":
             return "sent", "Уже отправлено."
-        result = self.api.write_session(op)
+        if op.get("status") != "pending":
+            return "skip", "Уже отправляется."
+        claim = getattr(self.db, "claim_session_op", None)
+        if claim is not None and not claim(op_id):
+            return "skip", "Уже отправляется."
+        try:
+            result = self.api.write_session(op)
+        except Exception:
+            logger().exception("Сбой записи смены")
+            self.db.mark_session_op_retry(op_id, "Сбой отправки")
+            return "queued", "Связи нет. Изменение сохранено на этом компьютере и уйдёт на сервер само."
         kind, message = classify_session_write(result, self.api._blocked(result))
         if kind == "sent":
             self.db.mark_session_op_sent(op_id)
@@ -331,12 +394,14 @@ class ShiftBook:
 
     def _remember(self, op: dict, saved: dict) -> None:
         users, sessions = self.db.load_directory()
+        payload = _stored_payload(op)
         if str(op.get("op") or "") == "create":
             if not saved.get("id"):
                 return
             row = dict(saved)
             if row.get("userId") is None and op.get("user_id"):
                 row["userId"] = _id_value(op.get("user_id"))
+            keep_shift_span(row, payload)
             sessions = [item for item in sessions if str(item.get("id")) != str(row.get("id"))]
             sessions.append(row)
         elif saved:
@@ -347,6 +412,7 @@ class ShiftBook:
                 if str(item.get("id")) == session_id:
                     merged = dict(item)
                     merged.update(saved)
+                    keep_shift_span(merged, payload)
                     updated.append(merged)
                     found = True
                 else:
@@ -355,6 +421,7 @@ class ShiftBook:
             if not found and session_id:
                 row = dict(saved)
                 row.setdefault("id", session_id)
+                keep_shift_span(row, payload)
                 sessions.append(row)
         self.db.save_directory(users, sessions)
 

@@ -12,9 +12,11 @@ from scanner_app.shifts import (
     STATE_LABELS,
     STATE_NEVER,
     clock_short,
+    end_clock_label,
     format_date_ru,
     format_duration,
     is_open,
+    session_end_day,
     person_name,
     person_state,
     sessions_for_user,
@@ -105,7 +107,7 @@ class ShiftsWindow(tk.Toplevel):
         pane.add(left, weight=3)
         pane.add(right, weight=4)
 
-        self.people = ttk.Treeview(left, columns=("name", "badge", "state"), show="headings", height=16)
+        self.people = ttk.Treeview(left, columns=("name", "badge", "state"), show="headings", height=8)
         self.people.heading("name", text="Сотрудник")
         self.people.heading("badge", text="Бейдж")
         self.people.heading("state", text="Сейчас")
@@ -121,26 +123,30 @@ class ShiftsWindow(tk.Toplevel):
         ttk.Label(right, textvariable=self._person_title, font=(self.serif, 22)).pack(anchor="w", pady=(0, 8))
         actions = ttk.Frame(right)
         actions.pack(fill="x", pady=(0, 8))
-        ttk.Button(actions, text="Начать смену", command=self._start, style="Accent.TButton").pack(side="left")
-        ttk.Button(actions, text="Завершить смену", command=self._finish).pack(side="left", padx=8)
+        self.start_button = ttk.Button(actions, text="Начать смену", command=self._start, style="Accent.TButton")
+        self.start_button.pack(side="left")
+        self.finish_button = ttk.Button(actions, text="Завершить смену", command=self._finish)
+        self.finish_button.pack(side="left", padx=8)
         ttk.Button(actions, text="Изменить смену", command=self._edit).pack(side="left")
-        ttk.Label(
+        self.session_hint = ttk.Label(
             right,
             text="Двойной щелчок меняет смену. У идущей — только приход, у завершённой — приход и уход.",
             wraplength=420,
             justify="left",
-        ).pack(side="bottom", anchor="w", pady=(8, 0))
-        self.sessions = ttk.Treeview(right, columns=("date", "start", "end", "length", "state"), show="headings", height=12)
+        )
+        self.session_hint.pack(side="bottom", fill="x", anchor="w", pady=(8, 0))
+        self.sessions = ttk.Treeview(right, columns=("date", "start", "end", "length", "state"), show="headings", height=6)
         for column, title, width in (
             ("date", "Дата", 110),
             ("start", "Приход", 80),
-            ("end", "Уход", 80),
+            ("end", "Уход", 130),
             ("length", "Длительность", 110),
             ("state", "Состояние", 180),
         ):
             self.sessions.heading(column, text=title)
             self.sessions.column(column, width=width, anchor="w")
-        self.sessions.pack(fill="both", expand=True, pady=4)
+        self.sessions.pack(side="top", fill="both", expand=True, pady=(0, 0))
+        self._paint_shift_actions()
         self.sessions.tag_configure("open", foreground=self._theme["in_text"])
         self.sessions.tag_configure("closed", foreground=self._theme["text"])
         self.sessions.tag_configure("pending", foreground=self._theme["warn_text"])
@@ -209,33 +215,47 @@ class ShiftsWindow(tk.Toplevel):
             rows.append((user, state, name, badge))
         order = {STATE_AT_WORK: 0, STATE_AWAY: 1, STATE_NEVER: 2}
         rows.sort(key=lambda item: (order.get(item[1], 9), item[2].casefold()))
-        children = self.people.get_children()
-        if children:
-            self.people.delete(*children)
+        tree_rows = []
         chosen = None
         for user, state, name, badge in rows:
             iid = str(user.get("id"))
-            self.people.insert("", "end", iid=iid, values=(name, badge or "—", STATE_LABELS.get(state, state)), tags=(state,))
+            tree_rows.append((iid, (name, badge or "—", STATE_LABELS.get(state, state)), (state,)))
             if iid == selected:
                 chosen = iid
-        if chosen:
-            self.people.selection_set(chosen)
-            self.people.see(chosen)
-        elif rows:
-            first = str(rows[0][0].get("id"))
-            self.people.selection_set(first)
+        self._filling = True
+        try:
+            _sync_tree(self.people, tree_rows)
+            if chosen:
+                if self.people.selection() != (chosen,):
+                    self.people.selection_set(chosen)
+                    self.people.see(chosen)
+            elif rows:
+                first = str(rows[0][0].get("id"))
+                if self.people.selection() != (first,):
+                    self.people.selection_set(first)
+            elif self.people.selection():
+                self.people.selection_remove(*self.people.selection())
+        finally:
+            self._filling = False
         self._paint_filters()
         self._fill_sessions()
 
     def _fill_sessions(self) -> None:
-        user = self._current_user()
-        children = self.sessions.get_children()
-        if children:
-            self.sessions.delete(*children)
-        if not user:
-            self._person_title.set("Выберите сотрудника")
+        if getattr(self, "_filling", False):
             return
-        self._person_title.set(person_name(user))
+        user = self._current_user()
+        if not user:
+            children = self.sessions.get_children()
+            if children:
+                self.sessions.delete(*children)
+            if self._person_title.get() != "Выберите сотрудника":
+                self._person_title.set("Выберите сотрудника")
+            self._paint_shift_actions()
+            return
+        title = person_name(user)
+        if self._person_title.get() != title:
+            self._person_title.set(title)
+        tree_rows = []
         for session in sessions_for_user(self._sessions, user.get("id")):
             iid = _session_iid(session)
             if is_open(session):
@@ -248,19 +268,27 @@ class ShiftsWindow(tk.Toplevel):
             if session.get("pending"):
                 state += ", ждёт отправки"
                 tag = "pending"
-            self.sessions.insert(
-                "",
-                "end",
-                iid=iid,
-                tags=(tag,),
-                values=(
-                    format_date_ru(str(session.get("date") or "")),
-                    clock_short(str(session.get("startTime") or "")) or "—",
-                    clock_short(str(session.get("endTime") or "")) or "—",
-                    length,
-                    state,
-                ),
+            tree_rows.append(
+                (
+                    iid,
+                    (
+                        format_date_ru(str(session.get("date") or "")),
+                        clock_short(str(session.get("startTime") or "")) or "—",
+                        end_clock_label(session),
+                        length,
+                        state,
+                    ),
+                    (tag,),
+                )
             )
+        _sync_tree(self.sessions, tree_rows)
+        self._paint_shift_actions()
+
+    def _paint_shift_actions(self) -> None:
+        user = self._current_user()
+        open_shift = bool(user) and any(is_open(row) for row in sessions_for_user(self._sessions, user.get("id")))
+        self.start_button.configure(style="TButton" if open_shift else "Accent.TButton")
+        self.finish_button.configure(style="Accent.TButton" if open_shift else "TButton")
 
     def _start(self) -> None:
         user = self._current_user()
@@ -338,7 +366,7 @@ class ShiftsWindow(tk.Toplevel):
             {
                 "date": format_date_ru(str(session.get("date") or "")),
                 "time": clock_short(str(session.get("startTime") or "")),
-                "end_date": format_date_ru(str(session.get("endDate") or session.get("date") or "")),
+                "end_date": format_date_ru(session_end_day(session) or str(session.get("date") or "")),
                 "end_time": clock_short(str(session.get("endTime") or "")),
             },
             self._theme,
@@ -365,7 +393,7 @@ class ShiftsWindow(tk.Toplevel):
             snapshot = ShiftBook(self.app.db, self.app.api).load()
             self._post(lambda: self._apply(snapshot, message if kind != "rejected" else ""))
             if kind == "rejected":
-                self._post(lambda: messagebox.showerror("Смена", message, parent=self))
+                self._post(lambda text=message: self._show_error(text))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -442,6 +470,16 @@ class ShiftsWindow(tk.Toplevel):
         if event.widget is not self.sessions or event.width < 200:
             return
         self.sessions.column("state", width=max(140, event.width - 400))
+        if getattr(self, "session_hint", None) is not None:
+            self.session_hint.configure(wraplength=max(240, event.width - 8))
+
+    def _show_error(self, message: str) -> None:
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        messagebox.showerror("Смена", message, parent=self)
 
     def _post(self, callback) -> None:
         try:
@@ -463,6 +501,32 @@ def _session_iid(session: dict) -> str:
     if local_key:
         return "l:" + local_key
     return "s:" + str(session.get("id"))
+
+
+def _tree_tuple(value) -> tuple:
+    if value is None or value == "":
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(value)
+
+
+def _sync_tree(tree, rows: list) -> None:
+    """Обновить только изменившиеся строки. Выбор остаётся, если эта строка ещё есть."""
+    wanted = {iid for iid, _values, _tags in rows}
+    for iid in list(tree.get_children()):
+        if iid not in wanted:
+            tree.delete(iid)
+    for index, (iid, values, tags) in enumerate(rows):
+        values = tuple(values)
+        tags = tuple(tags)
+        if tree.exists(iid):
+            if _tree_tuple(tree.item(iid, "values")) != values or _tree_tuple(tree.item(iid, "tags")) != tags:
+                tree.item(iid, values=values, tags=tags)
+            if tree.index(iid) != index:
+                tree.move(iid, "", index)
+        else:
+            tree.insert("", index, iid=iid, values=values, tags=tags)
 
 
 def _ask_times(master, title: str, mode: str, initial: dict, theme: dict) -> dict | None:

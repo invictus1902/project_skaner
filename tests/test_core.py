@@ -9,7 +9,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from scanner_app.api import ApiClient, HttpResult, build_url, classify_post, extract_event, extract_name
+from scanner_app.api import ApiClient, HttpResult, build_url, classify_post, extract_event, extract_name, server_mark
 from scanner_app.config import (
     deep_merge,
     default_settings,
@@ -20,8 +20,20 @@ from scanner_app.config import (
     verify_password,
 )
 from scanner_app.db import Database
-from scanner_app.logic import decide_event, manual_badge, normalize_badge, plural, render_speech, speak_time
-from scanner_app.scanner import ScanAssembler
+from scanner_app.kiosk import EVENT_TEXT, history_mark_color
+from scanner_app.logic import (
+    decide_event,
+    format_history_time,
+    format_when,
+    manual_badge,
+    normalize_badge,
+    parse_iso,
+    plural,
+    render_speech,
+    speak_time,
+)
+from scanner_app.theme import theme_by_name
+from scanner_app.scanner import ScanAssembler, ScannerController
 from scanner_app.service import AttendanceService
 
 
@@ -62,6 +74,8 @@ class LogicTests(unittest.TestCase):
         self.assertEqual(decide_event("out", now - timedelta(hours=1), now, 16), "in")
         self.assertEqual(decide_event("in", now - timedelta(hours=20), now, 16), "in")
         self.assertEqual(decide_event("in", now + timedelta(minutes=5), now, 16), "out")
+        started = now - timedelta(hours=2)
+        self.assertEqual(decide_event("repeat", started, now, 16), "out")
 
     def test_render_speech_ignores_unknown_braces(self) -> None:
         text = render_speech("{name}. {event_phrase}. {time}.", {"name": "Анна", "event_phrase": "Приход на работу", "time": "9 часов 0 минут"})
@@ -78,6 +92,27 @@ class AssemblerTests(unittest.TestCase):
         options = dict(min_length=3, max_length=20, max_interval_ms=80, idle_flush_ms=200, terminators=["enter"])
         options.update(kwargs)
         return ScanAssembler(on_burst=on_burst, **options), bursts
+
+    def test_paused_scanner_drops_a_burst(self) -> None:
+        settings = default_settings()
+        got = []
+
+        def remember(text, duration, terminated, fast) -> None:
+            del duration, terminated, fast
+            got.append(text)
+
+        scanner = ScannerController(settings, remember)
+        scanner._rebuild()
+        scanner.paused = True
+        for char in "55001":
+            scanner.push_key(char=char)
+        scanner.push_key(terminator="enter")
+        self.assertEqual(got, [])
+        scanner.paused = False
+        for char in "55001":
+            scanner.push_key(char=char)
+        scanner.push_key(terminator="enter")
+        self.assertEqual(got, ["55001"])
 
     def test_fast_scanner_with_enter(self) -> None:
         assembler, bursts = self._assembler()
@@ -651,6 +686,173 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(store["rows"][0]["durationMinutes"], 180)
         self.assertFalse(any(method == "POST" and "workSessions" in url for method, url in seen))
 
+    def test_quick_second_scan_does_not_store_zero_minutes(self) -> None:
+        wall = '{"message":"Protected by Vercel Authentication","protection":{"vercel_auth_enabled":true}}'
+        store = {
+            "rows": [
+                {
+                    "id": 9,
+                    "userId": 2,
+                    "date": "2026-10-14",
+                    "startTime": "10:00:00",
+                    "endTime": None,
+                    "status": "active",
+                }
+            ]
+        }
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            if url.startswith("https://example.test"):
+                return 401, wall.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/users" in url:
+                return 200, '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001"}]'.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/workSessions" in url:
+                return 200, json.dumps(store["rows"]).encode("utf-8")
+            if request.method == "PATCH" and "id=eq.9" in url:
+                body = json.loads(request.data.decode("utf-8"))
+                store["rows"][0].update(body)
+                return 200, json.dumps([store["rows"][0]]).encode("utf-8")
+            return 500, b""
+
+        client = self._walled_client(transport)
+        quick = client.post_event(
+            {"badge": "adm001", "event": "out", "timestamp": "2026-10-14T10:00:20+06:00"}
+        )
+        self.assertTrue(quick.ok)
+        self.assertEqual(store["rows"][0]["status"], "completed")
+        self.assertEqual(store["rows"][0]["endTime"], "10:00:20")
+        self.assertEqual(store["rows"][0]["durationMinutes"], 1)
+
+        client._drop_sessions()
+        store["rows"] = [
+            {
+                "id": 9,
+                "userId": 2,
+                "date": "2026-10-14",
+                "startTime": "10:00:00",
+                "endTime": None,
+                "status": "active",
+            }
+        ]
+        backwards = client.post_event(
+            {"badge": "adm001", "event": "out", "timestamp": "2026-10-13T09:00:00+06:00"}
+        )
+        self.assertFalse(backwards.ok)
+        self.assertFalse(backwards.network_error)
+        self.assertEqual(store["rows"][0]["status"], "active")
+        self.assertIsNone(store["rows"][0].get("endTime"))
+        self.assertNotEqual(store["rows"][0].get("durationMinutes"), 0)
+
+    def test_express_shift_uses_the_scan_clock(self) -> None:
+        store = {"rows": []}
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            if request.method == "GET" and url.endswith("/users"):
+                return 200, '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001"}]'.encode("utf-8")
+            if request.method == "GET" and url.endswith("/workSessions"):
+                return 200, json.dumps(store["rows"]).encode("utf-8")
+            if request.method == "POST" and url.endswith("/api/qr-checkin"):
+                if not store["rows"] or store["rows"][0].get("endTime"):
+                    store["rows"] = [
+                        {
+                            "id": 5,
+                            "userId": 2,
+                            "date": "2026-10-14",
+                            "startTime": "03:15:04",
+                            "endTime": None,
+                            "status": "active",
+                        }
+                    ]
+                    body = '{"success": true, "action": "start", "fullName": "Эмир", "startTime": "03:15"}'
+                    return 200, body.encode("utf-8")
+                store["rows"][0].update({"endTime": "12:00:00", "durationMinutes": 0, "status": "completed"})
+                body = '{"success": true, "action": "end", "fullName": "Эмир", "endTime": "12:00", "durationMinutes": 0}'
+                return 200, body.encode("utf-8")
+            if request.method == "PATCH" and url.endswith("/workSessions/5"):
+                body = json.loads(request.data.decode("utf-8"))
+                store["rows"][0].update(body)
+                return 200, json.dumps(store["rows"][0]).encode("utf-8")
+            return 500, b""
+
+        settings = default_settings()
+        settings["server"]["read_url"] = "https://example.test"
+        settings["server"]["write_url"] = "https://example.test"
+        settings["server"]["base_url"] = "https://example.test"
+        settings["server"]["token"] = "jwt-1"
+        client = ApiClient(settings, transport=transport)
+        started = client.post_event(
+            {"badge": "adm001", "event": "in", "timestamp": "2026-10-14T09:15:04+06:00"}
+        )
+        self.assertTrue(started.ok)
+        arrival = parse_iso("2026-10-14T09:15:04+06:00")
+        self.assertEqual(store["rows"][0]["date"], "2026-10-14")
+        self.assertEqual(store["rows"][0]["startTime"], "09:15:04")
+        self.assertEqual(format_history_time(arrival, arrival), store["rows"][0]["startTime"][:5])
+        finished = client.post_event(
+            {"badge": "adm001", "event": "out", "timestamp": "2026-10-14T18:05:00+06:00"}
+        )
+        self.assertTrue(finished.ok)
+        departure = parse_iso("2026-10-14T18:05:00+06:00")
+        self.assertEqual(store["rows"][0]["endTime"], "18:05:00")
+        self.assertEqual(store["rows"][0]["durationMinutes"], 530)
+        self.assertEqual(format_history_time(departure, departure), store["rows"][0]["endTime"][:5])
+
+    def test_shift_written_during_download_stays_the_open_shift(self) -> None:
+        gets = {"n": 0}
+        holder = {}
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            if request.method == "GET" and url.endswith("/workSessions"):
+                gets["n"] += 1
+                if gets["n"] == 1:
+                    holder["client"]._remember_session(
+                        {
+                            "op": "create",
+                            "payload": {
+                                "userId": 2,
+                                "date": "2026-10-14",
+                                "startTime": "09:15:04",
+                                "endTime": None,
+                                "status": "active",
+                            },
+                        },
+                        {
+                            "id": 50,
+                            "userId": 2,
+                            "date": "2026-10-14",
+                            "startTime": "09:15:04",
+                            "endTime": None,
+                            "status": "active",
+                        },
+                    )
+                    return 200, b"[]"
+                body = '[{"id": 50, "userId": 2, "date": "2026-10-14", "startTime": "09:15:04", "endTime": null, "status": "active"}]'
+                return 200, body.encode("utf-8")
+            return 500, b""
+
+        settings = default_settings()
+        settings["server"]["read_url"] = "http://read"
+        settings["server"]["write_url"] = "http://write"
+        settings["server"]["base_url"] = "http://read"
+        client = ApiClient(settings, transport=transport)
+        holder["client"] = client
+        stale = client._directory_sessions(refresh=True)
+        self.assertTrue(any(row.get("id") == 50 for row in stale.data))
+        opened, failure = client._open_for_user(2)
+        self.assertIsNone(failure)
+        self.assertIsNotNone(opened)
+        self.assertEqual(opened["id"], 50)
+        self.assertEqual(gets["n"], 2)
+        again, _failure = client._open_for_user(2)
+        self.assertEqual(again["id"], 50)
+        self.assertEqual(gets["n"], 2)
+
     def test_stale_open_shift_is_closed_and_a_new_one_starts(self) -> None:
         wall = '{"message":"Protected by Vercel Authentication","protection":{"vercel_auth_enabled":true}}'
         store = {
@@ -838,6 +1040,65 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(client.health_state(), "online")
         self.assertEqual(len(calls), downloaded)
 
+    def test_repeat_and_departure_do_not_reload_sessions(self) -> None:
+        store = {
+            "rows": [
+                {
+                    "id": 9,
+                    "userId": 2,
+                    "date": "2026-10-14",
+                    "startTime": "08:28:00",
+                    "endTime": None,
+                    "status": "active",
+                }
+            ]
+        }
+        gets = {"sessions": 0, "checkins": 0}
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            if request.method == "GET" and url.endswith("/users"):
+                return 200, '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001"}]'.encode("utf-8")
+            if request.method == "GET" and url.endswith("/workSessions"):
+                gets["sessions"] += 1
+                return 200, json.dumps(store["rows"]).encode("utf-8")
+            if request.method == "POST" and url.endswith("/api/qr-checkin"):
+                gets["checkins"] += 1
+                if gets["checkins"] == 1:
+                    body = '{"success": true, "action": "start", "fullName": "Эмир", "startTime": "08:28"}'
+                else:
+                    body = '{"success": true, "action": "end", "fullName": "Эмир", "endTime": "12:00"}'
+                return 200, body.encode("utf-8")
+            if request.method == "PATCH" and url.endswith("/workSessions/9"):
+                body = json.loads(request.data.decode("utf-8"))
+                store["rows"][0].update(body)
+                return 200, json.dumps(store["rows"][0]).encode("utf-8")
+            return 500, b""
+
+        settings = default_settings()
+        settings["server"]["read_url"] = "https://example.test"
+        settings["server"]["write_url"] = "https://example.test"
+        settings["server"]["base_url"] = "https://example.test"
+        settings["server"]["token"] = "jwt-1"
+        client = ApiClient(settings, transport=transport)
+        repeated = client.post_event(
+            {"badge": "adm001", "event": "in", "timestamp": "2026-10-14T08:47:00+06:00"}
+        )
+        self.assertTrue(repeated.ok)
+        self.assertEqual(repeated.data.get("event"), "repeat")
+        self.assertEqual(gets["sessions"], 1)
+        self.assertEqual(client.get_status("adm001").data["last_event"], "in")
+        self.assertEqual(gets["sessions"], 1)
+        finished = client.post_event(
+            {"badge": "adm001", "event": "out", "timestamp": "2026-10-14T18:05:00+06:00"}
+        )
+        self.assertTrue(finished.ok)
+        self.assertEqual(extract_event(finished.data), "out")
+        self.assertEqual(store["rows"][0]["endTime"], "18:05:00")
+        self.assertEqual(client.get_status("adm001").data["last_event"], "out")
+        self.assertEqual(gets["sessions"], 1)
+
     def test_old_single_address_fills_both_links(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "settings.json"
@@ -869,6 +1130,124 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(seen["url"], "http://server/api/attendance/events")
         self.assertEqual(seen["auth"], "Bearer secret")
         self.assertEqual(client.health_state(), "online")
+
+    def test_edited_open_shift_is_closed_without_a_second_express_arrival(self) -> None:
+        store = {
+            "rows": [
+                {
+                    "id": 9,
+                    "userId": 2,
+                    "date": "2026-10-14",
+                    "startTime": "09:00:00",
+                    "endTime": None,
+                    "status": "manually_edited",
+                }
+            ]
+        }
+        calls = []
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            calls.append((request.method, url))
+            if request.method == "GET" and url.endswith("/users"):
+                return 200, '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001"}]'.encode("utf-8")
+            if request.method == "GET" and url.endswith("/workSessions"):
+                return 200, json.dumps(store["rows"]).encode("utf-8")
+            if request.method == "POST" and url.endswith("/api/qr-checkin"):
+                return 200, b'{"success": true, "action": "start", "fullName": "\xd0\xad\xd0\xbc\xd0\xb8\xd1\x80", "startTime": "12:00"}'
+            if request.method == "PATCH" and url.endswith("/workSessions/9"):
+                body = json.loads(request.data.decode("utf-8"))
+                store["rows"][0].update(body)
+                return 200, json.dumps(store["rows"][0]).encode("utf-8")
+            if request.method == "POST" and url.endswith("/workSessions"):
+                body = json.loads(request.data.decode("utf-8"))
+                row = {"id": 99, "userId": body.get("userId"), "date": body.get("date"), "startTime": body.get("startTime"), "endTime": None, "status": "active"}
+                store["rows"].append(row)
+                return 201, json.dumps(row).encode("utf-8")
+            return 500, b""
+
+        settings = default_settings()
+        settings["server"]["read_url"] = "https://example.test"
+        settings["server"]["write_url"] = "https://example.test"
+        settings["server"]["base_url"] = "https://example.test"
+        settings["server"]["token"] = "jwt-1"
+        client = ApiClient(settings, transport=transport)
+        result = client.post_event(
+            {"badge": "adm001", "event": "in", "timestamp": "2026-10-14T12:00:00+06:00", "name": "Эмир"}
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(extract_event(result.data), "out")
+        self.assertEqual(len(store["rows"]), 1)
+        self.assertEqual(store["rows"][0]["status"], "completed")
+        self.assertEqual(store["rows"][0]["endTime"], "12:00:00")
+        self.assertEqual(store["rows"][0]["durationMinutes"], 180)
+        self.assertFalse(any(url.endswith("/api/qr-checkin") for _method, url in calls))
+        self.assertFalse(any(method == "POST" and url.endswith("/workSessions") for method, url in calls))
+
+    def test_express_stale_shift_is_closed_and_a_new_one_starts(self) -> None:
+        store = {
+            "rows": [
+                {
+                    "id": 9,
+                    "userId": 2,
+                    "date": "2026-10-13",
+                    "startTime": "08:00:00",
+                    "endTime": None,
+                    "status": "active",
+                }
+            ]
+        }
+        calls = []
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            calls.append((request.method, url))
+            if request.method == "GET" and url.endswith("/users"):
+                return 200, '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001"}]'.encode("utf-8")
+            if request.method == "GET" and url.endswith("/workSessions"):
+                return 200, json.dumps(store["rows"]).encode("utf-8")
+            if request.method == "POST" and url.endswith("/api/qr-checkin"):
+                return 200, b'{"success": true, "action": "end", "fullName": "\xd0\xad\xd0\xbc\xd0\xb8\xd1\x80", "endTime": "18:00"}'
+            if request.method == "PATCH" and url.endswith("/workSessions/9"):
+                body = json.loads(request.data.decode("utf-8"))
+                store["rows"][0].update(body)
+                return 200, json.dumps(store["rows"][0]).encode("utf-8")
+            if request.method == "POST" and url.endswith("/workSessions"):
+                body = json.loads(request.data.decode("utf-8"))
+                row = {
+                    "id": 10,
+                    "userId": body.get("userId"),
+                    "date": body.get("date"),
+                    "startTime": body.get("startTime"),
+                    "endTime": None,
+                    "status": body.get("status") or "active",
+                }
+                store["rows"].append(row)
+                return 201, json.dumps(row).encode("utf-8")
+            return 500, b""
+
+        settings = default_settings()
+        settings["server"]["read_url"] = "https://example.test"
+        settings["server"]["write_url"] = "https://example.test"
+        settings["server"]["base_url"] = "https://example.test"
+        settings["server"]["token"] = "jwt-1"
+        client = ApiClient(settings, transport=transport)
+        result = client.post_event(
+            {"badge": "adm001", "event": "in", "timestamp": "2026-10-14T18:00:00+06:00", "name": "Эмир"}
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(extract_event(result.data), "in")
+        self.assertEqual(store["rows"][0]["status"], "completed")
+        self.assertEqual(store["rows"][0]["endTime"], "18:00:00")
+        self.assertEqual(store["rows"][0]["durationMinutes"], 2040)
+        self.assertEqual(store["rows"][1]["id"], 10)
+        self.assertEqual(store["rows"][1]["status"], "active")
+        self.assertEqual(store["rows"][1]["date"], "2026-10-14")
+        self.assertEqual(store["rows"][1]["startTime"], "18:00:00")
+        self.assertFalse(any(url.endswith("/api/qr-checkin") for _method, url in calls))
+        self.assertEqual(sum(1 for method, url in calls if method == "POST" and url.endswith("/workSessions")), 1)
 
 
 class DatabaseTests(unittest.TestCase):
@@ -1117,6 +1496,40 @@ class ServiceTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_failed_badge_does_not_stop_the_rest_of_the_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, _ui, _speaker, _api = self._service(folder, "http://server")
+            try:
+                class SelectiveApi(StubApi):
+                    def post_event(self, payload):
+                        self.posts.append(payload)
+                        if payload["badge"] == "A":
+                            return HttpResult(False, 500, {"message": "fail"}, None, False)
+                        return HttpResult(True, 200, {"ok": True, "event": payload["event"], "name": "Б"}, None, False)
+
+                service.api = SelectiveApi()
+                moment = datetime.now().astimezone()
+                db.insert_event("A", "А", "in", moment, {"badge": "A", "event": "in"})
+                db.insert_event("B", "Б", "in", moment, {"badge": "B", "event": "in"})
+                service._flush_pending()
+                self.assertEqual(db.get_event(1)["status"], "pending")
+                self.assertEqual(db.get_event(2)["status"], "sent")
+                self.assertEqual([item["badge"] for item in service.api.posts], ["A", "B"])
+            finally:
+                db.close()
+
+    def test_unsaved_scan_is_not_announced(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            service, db, ui, _speaker, api = self._service(folder, "http://server")
+            try:
+                db.close()
+                service._process("10001", background=True)
+                self.assertEqual(ui.views[-1]["state"], "error")
+                self.assertEqual(ui.views[-1]["title"], "ОШИБКА")
+                self.assertEqual(api.posts, [])
+            finally:
+                pass
+
     def test_unknown_badge_is_not_queued(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             service, db, ui, _speaker, api = self._service(folder, "http://server")
@@ -1271,6 +1684,116 @@ class ServiceTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_repeat_open_shift_is_not_shown_as_a_new_arrival(self) -> None:
+        store = {
+            "rows": [
+                {
+                    "id": 9,
+                    "userId": 2,
+                    "date": "2026-10-14",
+                    "startTime": "08:28:00",
+                    "endTime": None,
+                    "status": "active",
+                }
+            ]
+        }
+        patched = []
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            if request.method == "GET" and url.endswith("/users"):
+                return 200, '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001"}]'.encode("utf-8")
+            if request.method == "GET" and url.endswith("/workSessions"):
+                return 200, json.dumps(store["rows"]).encode("utf-8")
+            if request.method == "POST" and url.endswith("/api/qr-checkin"):
+                body = '{"success": true, "action": "start", "fullName": "Эмир", "startTime": "08:28"}'
+                return 200, body.encode("utf-8")
+            if request.method == "PATCH":
+                patched.append(json.loads(request.data.decode("utf-8")))
+                return 200, json.dumps(store["rows"][0]).encode("utf-8")
+            return 500, b""
+
+        scan = parse_iso("2026-10-14T08:47:00+06:00")
+        self.assertIsNotNone(scan)
+        settings = default_settings()
+        settings["server"]["read_url"] = "https://example.test"
+        settings["server"]["write_url"] = "https://example.test"
+        settings["server"]["base_url"] = "https://example.test"
+        settings["server"]["token"] = "jwt-1"
+        settings["voice"]["beep"] = False
+        settings["voice"]["enabled"] = True
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "t.db")
+            ui = FakeUi()
+            speaker = FakeSpeaker()
+            client = ApiClient(settings, transport=transport)
+            service = AttendanceService(settings, db, client, speaker, ui)
+            try:
+                result = client.post_event(
+                    {
+                        "badge": "adm001",
+                        "event": "in",
+                        "timestamp": "2026-10-14T08:47:00+06:00",
+                        "name": "Эмир",
+                    }
+                )
+                self.assertTrue(result.ok)
+                self.assertEqual(store["rows"][0]["startTime"], "08:28:00")
+                self.assertIsNone(store["rows"][0].get("endTime"))
+                self.assertEqual(store["rows"][0]["status"], "active")
+                self.assertEqual(patched, [])
+                kind, marked = server_mark(result.data, "in", scan)
+                self.assertEqual(kind, "repeat")
+                self.assertEqual(marked.strftime("%H:%M"), "08:28")
+                event_id = db.insert_event(
+                    "adm001",
+                    "Эмир",
+                    "in",
+                    scan,
+                    {"badge": "adm001", "event": "in", "timestamp": "2026-10-14T08:47:00+06:00"},
+                )
+                service._apply_server_result(
+                    settings,
+                    event_id,
+                    "adm001",
+                    "in",
+                    "Эмир",
+                    "Эмир",
+                    format_when(scan),
+                    "",
+                    result,
+                    "sent",
+                    "Отправлено",
+                    announce=False,
+                    moment=scan,
+                )
+                row = db.recent_events(1)[0]
+                self.assertEqual(row["event_type"], "repeat")
+                self.assertIn("T08:28", row["scanned_at"])
+                self.assertNotIn("T08:47", row["scanned_at"])
+                shown = format_history_time(
+                    parse_iso(row["scanned_at"]),
+                    datetime(2026, 10, 14, 12, 0, tzinfo=scan.tzinfo),
+                )
+                self.assertEqual(shown, "08:28")
+                self.assertEqual(ui.views[-1]["title"], "УЖЕ НА РАБОТЕ")
+                self.assertNotEqual(ui.views[-1]["state"], "in")
+                self.assertIn("уже на работе", ui.views[-1]["detail"].lower())
+                self.assertIn("08:28", ui.views[-1]["detail"])
+                self.assertNotIn("08:47", ui.views[-1]["detail"])
+                self.assertIn("08:28", ui.views[-1]["when"])
+                self.assertIn("уже на работе", speaker.said[-1].lower())
+                self.assertEqual(EVENT_TEXT["repeat"], "Повтор")
+                theme = theme_by_name("dark")
+                self.assertEqual(history_mark_color(theme, "repeat", "sent"), theme["muted"])
+                self.assertEqual(history_mark_color(theme, "in", "sent"), theme["in_text"])
+                contrast = theme_by_name("contrast")
+                self.assertEqual(history_mark_color(contrast, "repeat", "sent"), contrast["muted"])
+                self.assertNotEqual(history_mark_color(contrast, "repeat", "sent"), contrast["in_text"])
+            finally:
+                db.close()
+
     def test_screen_is_shown_before_the_server_answers(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             service, db, ui, speaker, api = self._service(folder, "http://server")
@@ -1340,4 +1863,122 @@ class ServiceTests(unittest.TestCase):
                 deadline = time.monotonic() + 2
                 while time.monotonic() < deadline and db.count_pending():
                     time.sleep(0.01)
+                db.close()
+
+    def _fresh_open_shift(self):
+        now = datetime.now().astimezone()
+        started = now - timedelta(minutes=19)
+        return now, started, {
+            "id": 9,
+            "userId": 2,
+            "date": started.strftime("%Y-%m-%d"),
+            "startTime": started.strftime("%H:%M:%S"),
+            "endTime": None,
+            "status": "active",
+        }
+
+    def test_repeat_screen_does_not_flash_departure(self) -> None:
+        now, started, row = self._fresh_open_shift()
+        store = {"rows": [row]}
+        calls = []
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            calls.append((request.method, url))
+            if request.method == "GET" and url.endswith("/users"):
+                return 200, '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001"}]'.encode("utf-8")
+            if request.method == "GET" and url.endswith("/workSessions"):
+                return 200, json.dumps(store["rows"]).encode("utf-8")
+            if request.method == "POST" and url.endswith("/api/qr-checkin"):
+                body = {
+                    "success": True,
+                    "action": "start",
+                    "fullName": "Эмир",
+                    "startTime": started.strftime("%H:%M"),
+                }
+                return 200, json.dumps(body).encode("utf-8")
+            if request.method == "PATCH":
+                return 200, json.dumps(store["rows"][0]).encode("utf-8")
+            return 500, b""
+
+        settings = default_settings()
+        settings["server"]["read_url"] = "https://example.test"
+        settings["server"]["write_url"] = "https://example.test"
+        settings["server"]["base_url"] = "https://example.test"
+        settings["server"]["token"] = "jwt-1"
+        settings["scanner"]["cooldown_sec"] = 0
+        settings["voice"]["enabled"] = True
+        settings["voice"]["beep"] = False
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "t.db")
+            ui = FakeUi()
+            speaker = FakeSpeaker()
+            service = AttendanceService(settings, db, ApiClient(settings, transport=transport), speaker, ui)
+            try:
+                event_id = service._process("adm001", background=True)
+                self.assertEqual(ui.views, [])
+                self.assertEqual(speaker.said, [])
+                service._send_saved(event_id)
+                self.assertEqual([view["title"] for view in ui.views], ["УЖЕ НА РАБОТЕ"])
+                self.assertNotEqual(ui.views[-1]["state"], "out")
+                self.assertIn("уже на работе", ui.views[-1]["detail"].lower())
+                self.assertIn(started.strftime("%H:%M"), ui.views[-1]["detail"])
+                self.assertNotIn(now.strftime("%H:%M"), ui.views[-1]["detail"])
+                self.assertIn("уже на работе", speaker.said[-1].lower())
+                self.assertTrue(any(url.endswith("/api/qr-checkin") for _method, url in calls))
+                self.assertFalse(any(method == "PATCH" for method, _url in calls))
+                saved = db.recent_events(1)[0]
+                self.assertEqual(saved["event_type"], "repeat")
+                self.assertIn("T" + started.strftime("%H:%M"), saved["scanned_at"])
+            finally:
+                db.close()
+
+    def test_real_departure_is_shown_as_departure(self) -> None:
+        _now, started, row = self._fresh_open_shift()
+        store = {"rows": [dict(row)]}
+        calls = []
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            calls.append((request.method, url))
+            if request.method == "GET" and url.endswith("/users"):
+                return 200, '[{"id": 2, "fullName": "Эмир", "badgeId": "adm001"}]'.encode("utf-8")
+            if request.method == "GET" and url.endswith("/workSessions"):
+                return 200, json.dumps(store["rows"]).encode("utf-8")
+            if request.method == "POST" and url.endswith("/api/qr-checkin"):
+                store["rows"][0].update({"endTime": "12:00:00", "durationMinutes": 19, "status": "completed"})
+                body = '{"success": true, "action": "end", "fullName": "Эмир", "endTime": "12:00", "durationMinutes": 19}'
+                return 200, body.encode("utf-8")
+            if request.method == "PATCH" and url.endswith("/workSessions/9"):
+                body = json.loads(request.data.decode("utf-8"))
+                store["rows"][0].update(body)
+                return 200, json.dumps(store["rows"][0]).encode("utf-8")
+            return 500, b""
+
+        settings = default_settings()
+        settings["server"]["read_url"] = "https://example.test"
+        settings["server"]["write_url"] = "https://example.test"
+        settings["server"]["base_url"] = "https://example.test"
+        settings["server"]["token"] = "jwt-1"
+        settings["scanner"]["cooldown_sec"] = 0
+        settings["voice"]["enabled"] = True
+        settings["voice"]["beep"] = False
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "t.db")
+            ui = FakeUi()
+            speaker = FakeSpeaker()
+            service = AttendanceService(settings, db, ApiClient(settings, transport=transport), speaker, ui)
+            try:
+                event_id = service._process("adm001", background=True)
+                self.assertEqual(ui.views, [])
+                service._send_saved(event_id)
+                self.assertEqual([view["title"] for view in ui.views], ["УХОД"])
+                self.assertEqual(ui.views[-1]["state"], "out")
+                self.assertTrue(any(url.endswith("/api/qr-checkin") for _method, url in calls))
+                self.assertEqual(store["rows"][0]["status"], "completed")
+                self.assertTrue(store["rows"][0].get("endTime"))
+                self.assertIn("Уход", speaker.said[-1])
+            finally:
                 db.close()

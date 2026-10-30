@@ -233,6 +233,21 @@ def ensure_independent(window) -> None:
         pass
 
 
+def arm_after(widget, previous, delay: int, callback):
+    """Поставить один таймер и снять предыдущий, чтобы старые after не копились."""
+    if previous is not None:
+        try:
+            widget.after_cancel(previous)
+        except Exception:
+            pass
+    if callback is None:
+        return None
+    try:
+        return widget.after(int(delay), callback)
+    except Exception:
+        return None
+
+
 def present_window(window) -> None:
     """Show a window above a fullscreen kiosk once, then let the user switch away."""
     try:

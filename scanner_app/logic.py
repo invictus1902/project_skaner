@@ -123,7 +123,7 @@ def decide_event(
     max_hours: float,
 ) -> str:
     """Следующая отметка: уход, если смена ещё открыта, иначе новый приход."""
-    if last_event == "in" and last_time is not None:
+    if last_event in ("in", "repeat") and last_time is not None:
         age = now - last_time
         # Отрицательный возраст — часы ушли назад. Смена всё ещё открыта,
         # второй приход её продублирует.
@@ -135,6 +135,8 @@ def decide_event(
 def event_phrase(event: str) -> str:
     if event == "out":
         return "Уход с работы"
+    if event == "repeat":
+        return "Уже на работе"
     return "Приход на работу"
 
 

@@ -14,18 +14,32 @@ from scanner_app.config import DB_PATH, load_settings, save_settings
 from scanner_app.db import Database
 from scanner_app.logging_setup import logger
 from scanner_app.logic import format_clock_date, format_history_time, parse_iso
-from scanner_app.scanner import ScannerController
+from scanner_app.scanner import ScannerController, accepts_typing
+from scanner_app.ui_helpers import arm_after
 from scanner_app.service import AttendanceService
 from scanner_app.fonts import faces
+from scanner_app.shifts import is_open
 from scanner_app.speech import Speaker
 from scanner_app.theme import theme_by_name
 
 EVENT_TEXT = {
     "in": "Приход",
     "out": "Уход",
+    "repeat": "Повтор",
     "unknown": "Не найден",
     "disabled": "Отключён",
 }
+
+
+def history_mark_color(theme: dict, event_type: str, status: str) -> str:
+    """Цвет точки в ленте. Повтор приглушён и не выглядит как новый приход."""
+    if event_type in ("unknown", "disabled") or status == "rejected":
+        return theme["error_text"]
+    if event_type == "repeat":
+        return theme["muted"]
+    if event_type == "in":
+        return theme["in_text"]
+    return theme["out_text"]
 STATUS_TEXT = {
     "pending": "в очереди",
     "sending": "отправляется",
@@ -43,6 +57,7 @@ FONT_BASE = {
     "history": 13,
     "heading": 12,
     "kicker": 11,
+    "caption": 22,
     "small": 12,
     "footer": 15,
 }
@@ -106,16 +121,20 @@ def _wrap_lines(text: str, font, width: int) -> list:
     return lines or [""]
 
 
-def keyboard_language() -> int | None:
-    if os.name != "nt":
-        return None
-    try:
-        user32 = ctypes.windll.user32
-        hwnd = user32.GetForegroundWindow()
-        thread_id = user32.GetWindowThreadProcessId(hwnd, None)
-        return int(user32.GetKeyboardLayout(thread_id) & 0xFFFF)
-    except Exception:
-        return None
+_LAYOUT_HINT = (
+    "Русская раскладка: буквы в QR могут считаться неверно. Переключите на английскую — Alt+Shift."
+)
+_LAYOUT_HINT_MS = 6000
+_RU_LAYOUT_LETTERS = frozenset("йцукенгшщзхъфывапролджэячсмитьбюё")
+
+
+def looks_like_russian_layout(text: str) -> bool:
+    """Код из букв русской клавиатуры: латиница QR прочиталась как кириллица."""
+    letters = [char for char in str(text or "").casefold() if char.isalpha()]
+    if not letters:
+        return False
+    russian = sum(char in _RU_LAYOUT_LETTERS for char in letters)
+    return russian > 0 and russian * 2 >= len(letters)
 
 
 class KioskApp:
@@ -123,6 +142,11 @@ class KioskApp:
         self.settings = load_settings()
         self.db = Database(DB_PATH)
         self.api = ApiClient(self.settings)
+        # Справочник качается вместе со сборкой окна, а не после первого скана.
+        self._health_lock = threading.Lock()
+        self._pending_health = None
+        self._health_busy = True
+        threading.Thread(target=self._prefetch_health, name="health", daemon=True).start()
         self.speaker = Speaker()
         self._alive = True
         self._closing = False
@@ -130,7 +154,6 @@ class KioskApp:
         self._generation = 0
         self._scale = 1.0
         self._state = "idle"
-        self._health_busy = False
         self._link_state = "checking"
         self._shown_history = 0
         self._debug_subs: list = []
@@ -142,7 +165,14 @@ class KioskApp:
         self._window_placed = False
         self._date_text = ""
         self._banner_text = None
-        self._layout_language = None
+        self._layout_token = 0
+        self._layout_after = None
+        self._hold_after = None
+        self._floor_key = None
+        self._pending_count = 0
+        self._saved_at_work = None
+        self._saved_at_work_tick = -100
+        self._floor_tick = 0
         self._configured_size = (0, 0)
         self._history_key = None
         self._anim_token = 0
@@ -174,6 +204,12 @@ class KioskApp:
         self._history_fade_token = 0
         self._button_pressed = False
         self._button_press_token = 0
+        self._ui_queue: list = []
+        self._ui_queued = False
+        self._history_token = None
+        self._pending_token = None
+        self._floor_busy = False
+        self._pulse_job = None
 
         self.root = tk.Tk()
         self.root.title(self.settings["ui"]["title"])
@@ -193,6 +229,7 @@ class KioskApp:
         self._build()
         self.service = AttendanceService(self.settings, self.db, self.api, self.speaker, self)
         self.scanner = ScannerController(self.settings, self.service.on_burst)
+        self.root.bind_all("<FocusIn>", self._sync_scan_pause, add="+")
         self._scanner_wanted = enable_scanner
         self.service.start()
         if enable_scanner:
@@ -203,11 +240,11 @@ class KioskApp:
         self._apply_window_mode()
         self._render_idle()
         self._render_history()
-        self._set_pending(self.db.count_pending())
+        self._request_pending()
         self._clock_loop()
         self._health_loop()
         self.root.after(2500, self._paint_voice_warning)
-        self.root.after(40, self._pulse)
+        self._ensure_pulse()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<F11>", self._toggle_fullscreen)
         self.root.bind("<F12>", lambda _event: self.open_admin())
@@ -221,6 +258,8 @@ class KioskApp:
             return
         self._closing = True
         self._alive = False
+        self._layout_after = arm_after(self.root, self._layout_after, 0, None)
+        self._hold_after = arm_after(self.root, self._hold_after, 0, None)
         logger().info("Киоск останавливается")
         try:
             self.scanner.stop()
@@ -246,19 +285,51 @@ class KioskApp:
     def _later(self, callback) -> None:
         if not self._alive:
             return
+        self._ui_queue.append(callback)
+        if self._ui_queued:
+            return
+        self._ui_queued = True
         try:
-            self.root.after(0, callback)
+            self.root.after(0, self._flush_ui)
         except (tk.TclError, RuntimeError):
-            pass
+            self._ui_queued = False
+            self._ui_queue.clear()
+
+    def _flush_ui(self) -> None:
+        self._ui_queued = False
+        batch = self._ui_queue
+        self._ui_queue = []
+        for callback in batch:
+            if not self._alive:
+                return
+            try:
+                callback()
+            except Exception:
+                logger().exception("Ошибка обновления экрана")
 
     def show(self, view: dict) -> None:
         self._later(lambda payload=dict(view): self._render(payload))
 
     def refresh_history(self) -> None:
-        self._later(self._render_history)
+        if not self._alive:
+            return
+        if threading.current_thread() is threading.main_thread():
+            self._request_history()
+            return
+        token = object()
+        self._history_token = token
+        limit = self._shown_history or 8
+        try:
+            rows = self.db.recent_events(limit)
+        except Exception:
+            logger().exception("Не удалось прочитать ленту")
+            return
+        self._later(lambda rows=rows, token=token: self._deliver_history(rows, token))
 
     def set_pending(self, count: int) -> None:
-        self._later(lambda value=count: self._set_pending(value))
+        token = object()
+        self._pending_token = token
+        self._later(lambda value=count, token=token: self._deliver_pending(value, token))
 
     def debug(self, text: str) -> None:
         def deliver(message=text) -> None:
@@ -299,7 +370,7 @@ class KioskApp:
         self._apply_window_mode()
         self._paint_panel(self._state)
         self._render_history()
-        self._set_pending(self.db.count_pending())
+        self._request_pending()
         self._kick_health()
         logger().info("Настройки сохранены")
 
@@ -400,6 +471,16 @@ class KioskApp:
         self.rail_edge.pack(side="left", fill="y")
         self.stage.pack(side="left", fill="both", expand=True)
 
+        self.floor = tk.Frame(self.stage, bd=0, highlightthickness=0)
+        self.floor_work_caption = tk.Label(self.floor, text="На работе", anchor="e", font=self.fonts["detail"])
+        self.floor_work_value = tk.Label(self.floor, text="—", anchor="e", font=self.fonts["caption"])
+        self.floor_queue_caption = tk.Label(self.floor, text="В очереди", anchor="e", font=self.fonts["detail"])
+        self.floor_queue_value = tk.Label(self.floor, text="0", anchor="e", font=self.fonts["caption"])
+        self.floor_work_caption.grid(row=0, column=0, sticky="e", padx=(0, 18))
+        self.floor_work_value.grid(row=0, column=1, sticky="e")
+        self.floor_queue_caption.grid(row=1, column=0, sticky="e", padx=(0, 18), pady=(2, 0))
+        self.floor_queue_value.grid(row=1, column=1, sticky="e", pady=(2, 0))
+        self.floor.pack(side="bottom", anchor="e", padx=(24, 48), pady=(0, 16))
         self.copy = tk.Frame(self.stage, bd=0, highlightthickness=0)
         self.copy.pack(fill="both", expand=True, padx=56, pady=(8, 12))
         self.copy_top = tk.Frame(self.copy, bd=0, highlightthickness=0)
@@ -410,7 +491,7 @@ class KioskApp:
         self.signal_body = self.signal
         self.signal.pack(fill="x", pady=(0, 14), before=self.copy_bottom)
         self.signal.bind("<Configure>", self._on_signal_configure)
-        self.copy_kicker = tk.Label(self.copy, font=self.fonts["kicker"], anchor="center", justify="center")
+        self.copy_kicker = tk.Label(self.copy, font=self.fonts["caption"], anchor="center", justify="center")
         self.name_label = tk.Label(self.copy, font=self.fonts["name"], anchor="center", justify="center")
         self.when_label = tk.Label(self.copy, font=self.fonts["when"], anchor="center", justify="center")
         self.badge_label = tk.Label(self.copy, font=self.fonts["detail"], anchor="center", justify="center")
@@ -546,6 +627,7 @@ class KioskApp:
         self._stack_lines()
         self._play_status()
         self._start_reveal()
+        self._consider_layout_banner(view)
         for callback in list(self._result_subs):
             try:
                 callback(view)
@@ -553,7 +635,13 @@ class KioskApp:
                 logger().exception("Ошибка подписчика результата")
         if hold and self._state not in ("idle", "progress"):
             delay = int(self.settings["attendance"].get("result_hold_sec") or 8) * 1000
-            self.root.after(delay, lambda token=generation: self._return_idle(token))
+            self._hold_after = arm_after(
+                self.root,
+                self._hold_after,
+                delay,
+                lambda token=generation: self._return_idle(token),
+            )
+        self._ensure_pulse()
 
     def _stack_lines(self) -> None:
         name = str(self.name_label.cget("text") or "").strip()
@@ -570,7 +658,7 @@ class KioskApp:
         self.copy_kicker.configure(text=kicker)
         for widget in (self.copy_kicker, self.name_label, self.when_label, self.badge_label, self.detail_label):
             widget.pack_forget()
-        self.copy_kicker.pack(anchor="center", fill="x", pady=(0, 2), before=self.copy_bottom)
+        self.copy_kicker.pack(anchor="center", fill="x", pady=(12, 4), before=self.copy_bottom)
         previous = self.copy_kicker
         for widget in shown:
             space = (14, 0) if widget is self.detail_label else (4, 0)
@@ -586,7 +674,7 @@ class KioskApp:
         theme = self._theme()
         page = theme["bg"]
         targets = (
-            (self.copy_kicker, theme["accent"]),
+            (self.copy_kicker, theme["text"]),
             (self.name_label, theme["text"]),
             (self.when_label, theme["text"]),
             (self.badge_label, theme["muted"]),
@@ -925,20 +1013,36 @@ class KioskApp:
             return
         self._snap_pill()
 
+    def _ensure_pulse(self) -> None:
+        if not self._alive or self._pulse_job is not None:
+            return
+        try:
+            self._pulse_job = self.root.after(48, self._pulse)
+        except tk.TclError:
+            self._pulse_job = None
+
     def _pulse(self) -> None:
+        self._pulse_job = None
         if not self._alive:
             return
-        self._pulse_phase += 0.075
+        breathing = self._state in ("idle", "progress")
         try:
-            if self._state in ("idle", "progress") and not self._status_animating and self._glow_boost <= 0.01:
-                self._draw_pill()
+            if breathing:
+                self._pulse_phase += 0.075
+                if not self._status_animating and self._glow_boost <= 0.01:
+                    self._draw_pill()
+            elif self._link_state == "online":
+                self._pulse_phase += 0.25
             if self._link_state == "online":
                 theme = self._theme()
                 wave = 0.5 + 0.5 * math.sin(self._pulse_phase * 0.65)
                 self.dot.itemconfigure(self.dot_id, fill=_mix(theme["online"], "#ffffff", 0.16 * wave))
-            self.root.after(48, self._pulse)
+            if not breathing and self._link_state != "online":
+                return
+            delay = 48 if breathing else 160
+            self._pulse_job = self.root.after(delay, self._pulse)
         except tk.TclError:
-            pass
+            self._pulse_job = None
 
     def _button_size(self):
         font = self.fonts["footer"]
@@ -1091,17 +1195,70 @@ class KioskApp:
         self.copy.configure(bg=page)
         self.copy_top.configure(bg=page)
         self.copy_bottom.configure(bg=page)
-        self.copy_kicker.configure(bg=page, fg=theme["accent"])
+        self.copy_kicker.configure(bg=page, fg=theme["text"])
+        self.floor.configure(bg=page)
+        for widget in (self.floor_work_caption, self.floor_queue_caption):
+            widget.configure(bg=page, fg=theme["text"])
+        for widget in (self.floor_work_value, self.floor_queue_value):
+            widget.configure(bg=page, fg=theme["accent"])
         self.name_label.configure(bg=page, fg=theme["text"])
         self.when_label.configure(bg=page, fg=theme["text"])
         for widget in (self.badge_label, self.detail_label):
             widget.configure(bg=page, fg=theme["muted"])
 
-    def _render_history(self) -> None:
+    def _request_history(self) -> None:
+        if not self._alive:
+            return
+        token = object()
+        self._history_token = token
+        try:
+            limit = self._shown_history or self._history_limit()
+        except tk.TclError:
+            limit = self._shown_history or 8
+
+        def run(limit=limit, token=token) -> None:
+            try:
+                rows = self.db.recent_events(limit)
+            except Exception:
+                logger().exception("Не удалось прочитать ленту")
+                return
+            self._later(lambda rows=rows, token=token: self._deliver_history(rows, token))
+
+        threading.Thread(target=run, name="history", daemon=True).start()
+
+    def _deliver_history(self, rows, token) -> None:
+        if not self._alive or token is not self._history_token:
+            return
+        self._render_history(rows)
+
+    def _request_pending(self) -> None:
+        if not self._alive:
+            return
+        token = object()
+        self._pending_token = token
+
+        def run(token=token) -> None:
+            try:
+                count = self.db.count_pending()
+            except Exception:
+                logger().exception("Не удалось посчитать очередь")
+                return
+            self._later(lambda count=count, token=token: self._deliver_pending(count, token))
+
+        threading.Thread(target=run, name="pending", daemon=True).start()
+
+    def _deliver_pending(self, count: int, token) -> None:
+        if not self._alive or token is not self._pending_token:
+            return
+        self._set_pending(count)
+
+    def _render_history(self, rows=None) -> None:
+        if rows is None:
+            self._request_history()
+            return
         if not self._alive:
             return
         theme = self._theme()
-        rows = self.db.recent_events(self._history_limit())
         now = datetime.now().astimezone()
         if not rows:
             key = ("empty", self.settings["ui"].get("theme"))
@@ -1123,11 +1280,11 @@ class KioskApp:
             return
         self._history_key = key
         self._history_fade_token += 1
-        for child in self.history_rows.winfo_children():
-            child.destroy()
         bg = theme["bg"]
         if not rows:
             self._history_motion = ("empty",)
+            for child in self.history_rows.winfo_children():
+                child.destroy()
             tk.Label(
                 self.history_rows,
                 text="Пока нет отметок",
@@ -1142,76 +1299,25 @@ class KioskApp:
         lead_sig = (rows[0]["id"], rows[0]["status"], rows[0]["event_type"])
         animate_lead = self._history_motion is not None and lead_sig != self._history_motion
         self._history_motion = lead_sig
+        existing = {
+            child._hist_id: child
+            for child in self.history_rows.winfo_children()
+            if getattr(child, "_hist_id", None) is not None
+        }
+        wanted = {row["id"] for row in rows}
+        for child in list(self.history_rows.winfo_children()):
+            if getattr(child, "_hist_id", None) not in wanted:
+                child.destroy()
         lead_item = None
         for index, row in enumerate(rows):
-            moment = parse_iso(row["scanned_at"]) or now
-            event_name = EVENT_TEXT.get(row["event_type"], row["event_type"])
-            status_name = STATUS_TEXT.get(row["status"], row["status"])
-            event_color = theme["in_text"] if row["event_type"] == "in" else theme["out_text"]
-            if row["event_type"] in ("unknown", "disabled") or row["status"] == "rejected":
-                event_color = theme["error_text"]
-            status_color = theme["muted"]
-            if row["status"] in ("pending", "sending"):
-                status_color = theme["warn_text"]
-            elif row["status"] == "rejected":
-                status_color = theme["error_text"]
-            elif row["status"] == "sent":
-                status_color = theme["muted"]
-            item = tk.Frame(self.history_rows, bg=bg)
+            item = existing.get(row["id"])
+            if item is None or not item.winfo_exists():
+                item = self._create_history_row(bg)
+                item._hist_id = row["id"]
+            self._update_history_row(item, self._history_visual(row, theme, now))
             item.pack(fill="x", pady=0)
             if index == 0:
                 lead_item = item
-            mark = tk.Canvas(item, width=16, height=18, highlightthickness=0, bd=0, bg=bg)
-            mark.mark_color = event_color
-            mark.mark_line = theme["line"]
-            mark.bind(
-                "<Configure>",
-                lambda event, canvas=mark: self._paint_history_mark(
-                    event,
-                    getattr(canvas, "mark_color", "") or "",
-                    getattr(canvas, "mark_line", "") or "",
-                ),
-            )
-            mark.pack(side="left", anchor="n", fill="y", padx=(2, 8))
-            text = tk.Frame(item, bg=bg)
-            text.pack(side="left", fill="x", expand=True)
-            top = tk.Frame(text, bg=bg)
-            top.pack(fill="x")
-            tk.Label(
-                top,
-                text=format_history_time(moment, now),
-                anchor="w",
-                font=self.fonts["kicker"],
-                bg=bg,
-                fg=theme["muted"],
-            ).pack(side="left")
-            tk.Label(
-                top,
-                text=event_name,
-                anchor="e",
-                font=self.fonts["kicker"],
-                bg=bg,
-                fg=event_color,
-            ).pack(side="right")
-            tk.Label(
-                text,
-                text=row.get("name") or row["badge"],
-                anchor="w",
-                justify="left",
-                font=self.fonts["history"],
-                bg=bg,
-                fg=theme["text"],
-                wraplength=246,
-            ).pack(anchor="w", fill="x", pady=(2, 0 if row["status"] != "sent" else 8))
-            if row["status"] != "sent":
-                tk.Label(
-                    text,
-                    text=status_name,
-                    anchor="w",
-                    font=self.fonts["kicker"],
-                    bg=bg,
-                    fg=status_color,
-                ).pack(anchor="w", pady=(0, 8))
         self.history_rows.update_idletasks()
         self._trim_history()
         if animate_lead and lead_item is not None:
@@ -1220,6 +1326,106 @@ class KioskApp:
                     self._fade_history_lead(lead_item)
             except tk.TclError:
                 pass
+
+    def _history_visual(self, row: dict, theme: dict, now: datetime) -> tuple:
+        moment = parse_iso(row["scanned_at"]) or now
+        event_name = EVENT_TEXT.get(row["event_type"], row["event_type"])
+        status_name = STATUS_TEXT.get(row["status"], row["status"])
+        event_color = history_mark_color(theme, row["event_type"], row["status"])
+        status_color = theme["muted"]
+        if row["status"] in ("pending", "sending"):
+            status_color = theme["warn_text"]
+        elif row["status"] == "rejected":
+            status_color = theme["error_text"]
+        show_status = row["status"] != "sent"
+        return (
+            theme["bg"],
+            format_history_time(moment, now),
+            theme["muted"],
+            event_name,
+            event_color,
+            row.get("name") or row["badge"],
+            theme["text"],
+            show_status,
+            status_name,
+            status_color,
+            theme["line"],
+        )
+
+    def _create_history_row(self, bg: str):
+        item = tk.Frame(self.history_rows, bg=bg)
+        mark = tk.Canvas(item, width=16, height=18, highlightthickness=0, bd=0, bg=bg)
+        mark.mark_color = ""
+        mark.mark_line = ""
+        mark.bind(
+            "<Configure>",
+            lambda event, canvas=mark: self._paint_history_mark(
+                event,
+                getattr(canvas, "mark_color", "") or "",
+                getattr(canvas, "mark_line", "") or "",
+            ),
+        )
+        mark.pack(side="left", anchor="n", fill="y", padx=(2, 8))
+        text = tk.Frame(item, bg=bg)
+        text.pack(side="left", fill="x", expand=True)
+        top = tk.Frame(text, bg=bg)
+        top.pack(fill="x")
+        time_label = tk.Label(top, anchor="w", font=self.fonts["kicker"], bg=bg)
+        time_label.pack(side="left")
+        event_label = tk.Label(top, anchor="e", font=self.fonts["kicker"], bg=bg)
+        event_label.pack(side="right")
+        name_label = tk.Label(
+            text,
+            anchor="w",
+            justify="left",
+            font=self.fonts["history"],
+            bg=bg,
+            wraplength=246,
+        )
+        name_label.pack(anchor="w", fill="x")
+        status_label = tk.Label(text, anchor="w", font=self.fonts["kicker"], bg=bg)
+        item._mark = mark
+        item._text = text
+        item._top = top
+        item._time = time_label
+        item._event = event_label
+        item._name = name_label
+        item._status = status_label
+        item._visual = None
+        return item
+
+    def _update_history_row(self, item, visual: tuple) -> None:
+        if item._visual == visual:
+            return
+        item._visual = visual
+        (
+            bg,
+            when,
+            time_color,
+            event_name,
+            event_color,
+            name,
+            name_color,
+            show_status,
+            status_name,
+            status_color,
+            line,
+        ) = visual
+        for widget in (item, item._text, item._top, item._mark):
+            widget.configure(bg=bg)
+        item._time.configure(text=when, bg=bg, fg=time_color)
+        item._event.configure(text=event_name, bg=bg, fg=event_color)
+        item._name.configure(text=name, bg=bg, fg=name_color)
+        item._name.pack_configure(pady=(2, 0 if show_status else 8))
+        item._mark.mark_color = event_color
+        item._mark.mark_line = line
+        if show_status:
+            item._status.configure(text=status_name, bg=bg, fg=status_color)
+            if not item._status.winfo_ismapped():
+                item._status.pack(anchor="w", pady=(0, 8))
+        elif item._status.winfo_ismapped():
+            item._status.pack_forget()
+        self._paint_one_mark(item._mark, event_color)
 
     def _fade_history_lead(self, item) -> None:
         """Проявить только верхнюю, новую строку истории."""
@@ -1311,10 +1517,12 @@ class KioskApp:
 
     def _set_pending(self, count: int) -> None:
         theme = self._theme()
+        self._pending_count = int(count or 0)
         if count:
             self.pending_label.configure(text=f"В очереди на отправку: {count}", fg=theme["warn_text"])
         else:
             self.pending_label.configure(text="", fg=theme["muted"])
+        self._paint_floor()
 
     def _set_online(self, state: str) -> None:
         theme = self._theme()
@@ -1328,6 +1536,7 @@ class KioskApp:
         self._link_state = state
         self.dot.itemconfigure(self.dot_id, fill=colors.get(state, theme["unset"]))
         self.link_label.configure(text=labels.get(state, ""))
+        self._ensure_pulse()
 
     def _paint_clock(self) -> None:
         now = datetime.now()
@@ -1336,23 +1545,86 @@ class KioskApp:
         if date_text != self._date_text:
             self._date_text = date_text
             self.date_label.configure(text=date_text)
-        self._paint_layout()
+        self._paint_floor()
 
-    def _paint_layout(self) -> None:
+    def _consider_layout_banner(self, view: dict) -> None:
         if not self.settings["ui"].get("warn_layout"):
-            self._layout_language = None
-            self._set_banner("")
             return
-        language = keyboard_language()
-        if language == self._layout_language:
+        title = str(view.get("title") or "").casefold()
+        detail = str(view.get("detail") or "").casefold()
+        unrecognized = "не распознан" in title or "не распознан" in detail
+        if not unrecognized and not looks_like_russian_layout(str(view.get("badge") or "")):
             return
-        self._layout_language = language
-        if language == 0x0419:
-            self._set_banner(
-                "Русская раскладка: буквы в QR могут считаться неверно. Переключите на английскую — Alt+Shift."
-            )
-        else:
-            self._set_banner("")
+        self._layout_token += 1
+        token = self._layout_token
+        self._set_banner(_LAYOUT_HINT)
+        self._layout_after = arm_after(
+            self.root,
+            self._layout_after,
+            int(_LAYOUT_HINT_MS),
+            lambda token=token: self._hide_layout_banner(token),
+        )
+
+    def _hide_layout_banner(self, token: int) -> None:
+        if not self._alive or token != self._layout_token:
+            return
+        self._set_banner("")
+
+    def _at_work_count(self) -> int | None:
+        counted = self.api.open_shift_count()
+        if counted is not None:
+            self._saved_at_work = counted
+            self._saved_at_work_tick = self._floor_tick
+            return counted
+        self._floor_tick += 1
+        if self._floor_tick - self._saved_at_work_tick < 10:
+            return self._saved_at_work
+        if not self._floor_busy:
+            self._saved_at_work_tick = self._floor_tick
+            self._request_floor_count()
+        return self._saved_at_work
+
+    def _request_floor_count(self) -> None:
+        self._floor_busy = True
+
+        def run() -> None:
+            value = None
+            try:
+                _users, sessions = self.db.load_directory()
+                value = len(
+                    {
+                        str(row.get("userId"))
+                        for row in sessions
+                        if isinstance(row, dict) and str(row.get("userId") or "").strip() and is_open(row)
+                    }
+                )
+            except Exception:
+                logger().exception("Не удалось посчитать открытые смены")
+
+            def apply(value=value) -> None:
+                self._floor_busy = False
+                if not self._alive:
+                    return
+                if value is not None:
+                    self._saved_at_work = value
+                self._saved_at_work_tick = self._floor_tick
+                self._floor_key = None
+                self._paint_floor()
+
+            self._later(apply)
+
+        threading.Thread(target=run, name="floor", daemon=True).start()
+
+    def _paint_floor(self) -> None:
+        counted = self._at_work_count()
+        work = "—" if counted is None else str(counted)
+        queue = str(self._pending_count)
+        key = (work, queue)
+        if key == self._floor_key:
+            return
+        self._floor_key = key
+        self.floor_work_value.configure(text=work)
+        self.floor_queue_value.configure(text=queue)
 
     def _set_banner(self, text: str) -> None:
         if text == self._banner_text:
@@ -1393,10 +1665,43 @@ class KioskApp:
         if not self._alive:
             return
         try:
-            self._kick_health()
+            if self._health_busy:
+                self._deliver_health()
+            else:
+                self._kick_health()
             self.root.after(15000, self._health_loop)
         except tk.TclError:
             pass
+
+    def _prefetch_health(self) -> None:
+        try:
+            state = self.api.health_state()
+        except Exception:
+            logger().exception("Ошибка проверки сервера")
+            state = "offline"
+        with self._health_lock:
+            self._pending_health = state
+        self._deliver_health()
+
+    def _deliver_health(self) -> None:
+        root = getattr(self, "root", None)
+        if root is None:
+            return
+
+        def apply() -> None:
+            with self._health_lock:
+                state = self._pending_health
+                if state is None:
+                    return
+                self._pending_health = None
+            self._health_busy = False
+            if self._alive and state != self._link_state:
+                self._set_online(state)
+
+        try:
+            root.after(0, apply)
+        except (tk.TclError, RuntimeError):
+            self._health_busy = False
 
     def _kick_health(self) -> None:
         if self._health_busy:
@@ -1546,10 +1851,12 @@ class KioskApp:
         self.device_label.configure(text=device)
         self._paint_panel(self._state)
         self._snap_pill()
+        shown = "" if not self.settings["ui"].get("warn_layout") else (self._banner_text or "")
         self._banner_text = None
-        self._layout_language = None
         self._history_key = None
-        self._paint_layout()
+        self._set_banner(shown)
+        self._floor_key = None
+        self._paint_floor()
         self._render_history()
         self._set_online(self._link_state)
 
@@ -1573,6 +1880,12 @@ class KioskApp:
         if keyboard_on and not self.scanner.hook_ok:
             self.root.bind("<Key>", self._on_tk_key)
             logger().warning("Глобальный перехват клавиатуры недоступен. Сканер работает, только когда окно в фокусе.")
+
+    def _sync_scan_pause(self, event) -> None:
+        scanner = getattr(self, "scanner", None)
+        if scanner is None:
+            return
+        scanner.paused = accepts_typing(getattr(event, "widget", None))
 
     def _on_tk_key(self, event):
         scanner = getattr(self, "scanner", None)

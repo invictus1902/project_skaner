@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import os
+import time
 import tkinter as tk
+from tkinter import ttk
 import unittest
 
+from scanner_app.scanner import accepts_typing
 from scanner_app.ui_helpers import (
+    arm_after,
     describe_window,
     ensure_independent,
     is_independent,
@@ -67,6 +71,39 @@ class WindowLayoutTests(unittest.TestCase):
             root.update()
             self.assertEqual(root.state(), "iconic")
             self.assertNotEqual(top.state(), "iconic", describe_window(top))
+        finally:
+            root.destroy()
+
+    def test_text_entry_pauses_scanner_input(self) -> None:
+        root = tk.Tk()
+        try:
+            root.withdraw()
+            entry = tk.Entry(root)
+            typed = ttk.Entry(root)
+            button = tk.Button(root, text="ok")
+            self.assertTrue(accepts_typing(entry))
+            self.assertTrue(accepts_typing(typed))
+            self.assertFalse(accepts_typing(button))
+            self.assertFalse(accepts_typing(None))
+        finally:
+            root.destroy()
+
+    def test_new_timer_cancels_the_previous_one(self) -> None:
+        root = tk.Tk()
+        fired = []
+        try:
+            root.withdraw()
+            first = arm_after(root, None, 500, lambda: fired.append("old"))
+            second = arm_after(root, first, 40, lambda: fired.append("new"))
+            self.assertIsNotNone(second)
+            root.update()
+            time.sleep(0.08)
+            root.update()
+            self.assertEqual(fired, ["new"])
+            self.assertIsNone(arm_after(root, second, 0, None))
+            time.sleep(0.05)
+            root.update()
+            self.assertEqual(fired, ["new"])
         finally:
             root.destroy()
 

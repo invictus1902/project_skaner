@@ -706,6 +706,11 @@ class AdminWindow(tk.Toplevel):
         threading.Thread(target=run, daemon=True).start()
 
     def _apply_profiles(self, people: list, error: str) -> None:
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
         mapping = {}
         labels = []
         for person in people:
@@ -757,6 +762,11 @@ class AdminWindow(tk.Toplevel):
             result = client.sign_in(identifier, password)
 
             def apply() -> None:
+                try:
+                    if not self.winfo_exists():
+                        return
+                except tk.TclError:
+                    return
                 if not result.ok:
                     self.auth_text.set(result.error or "Вход не выполнен.")
                     return

@@ -93,6 +93,14 @@ class ScanAssembler:
             logger().exception("Ошибка обработчика сканера")
 
 
+def accepts_typing(widget) -> bool:
+    """Поле, в которое человек вписывает текст. Пока оно в фокусе, сканер молчит."""
+    try:
+        return str(widget.winfo_class()) in {"Entry", "TEntry", "Text"}
+    except Exception:
+        return False
+
+
 class ScannerController:
     def __init__(self, settings: dict, on_burst) -> None:
         self.settings = settings
@@ -146,6 +154,16 @@ class ScannerController:
         self._stop = threading.Event()
         self.start()
 
+    def push_key(self, char: str = "", terminator: str = "") -> None:
+        """Одна клавиша перехвата. В поле ввода она не становится отметкой."""
+        if self.paused:
+            return
+        if terminator:
+            self._assembler_call("push_terminator", terminator)
+            return
+        if char:
+            self._assembler_call("push_char", char)
+
     def feed_text(self, text: str, trusted: bool = False) -> None:
         """Прямая подача кода: имитация в админке или строка из COM-порта."""
         cleaned = str(text or "").strip()
@@ -185,20 +203,18 @@ class ScannerController:
             return
 
         def on_press(key):
-            if self.paused:
-                return
             try:
                 char = getattr(key, "char", None)
                 if char in ("\r", "\n"):
-                    self._assembler_call("push_terminator", "enter")
+                    self.push_key(terminator="enter")
                     return
                 if char:
-                    self._assembler_call("push_char", char)
+                    self.push_key(char=char)
                     return
                 if key == keyboard.Key.enter:
-                    self._assembler_call("push_terminator", "enter")
+                    self.push_key(terminator="enter")
                 elif key == keyboard.Key.tab:
-                    self._assembler_call("push_terminator", "tab")
+                    self.push_key(terminator="tab")
             except Exception:
                 logger().exception("Ошибка чтения клавиши сканера")
 

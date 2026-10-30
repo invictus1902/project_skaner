@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -14,7 +16,11 @@ from scanner_app.shifts import (
     STATE_NEVER,
     ShiftBook,
     duration_minutes,
+    end_clock_label,
+    format_date_ru,
+    keep_shift_span,
     person_state,
+    session_end_day,
     sessions_for_user,
 )
 
@@ -26,8 +32,22 @@ class ShiftLogicTests(unittest.TestCase):
         self.assertEqual(person_state([{"endTime": None}, {"endTime": "18:00:00"}]), STATE_AT_WORK)
         self.assertEqual(duration_minutes("2026-10-12", "22:00", "2026-10-13", "06:00"), 480)
         self.assertEqual(duration_minutes("12.10.2026", "22:00", "12.10.2026", "06:00"), 480)
+        self.assertEqual(duration_minutes("13.10.2026", "08:00", "14.10.2026", "10:00"), 1560)
         self.assertIsNone(duration_minutes("12.10.2026", "10:00", "10.10.2026", "09:00"))
         self.assertIsNone(duration_minutes("2026-10-12", "08:00", "2026-10-11", "10:00"))
+        overnight = {
+            "date": "2026-10-13",
+            "startTime": "08:00:00",
+            "endTime": "10:00:00",
+            "durationMinutes": 1560,
+        }
+        self.assertEqual(session_end_day(overnight), "2026-10-14")
+        self.assertEqual(end_clock_label(overnight), "14.10 10:00")
+        self.assertEqual(end_clock_label({**overnight, "durationMinutes": 120}), "10:00")
+        echoed = {"date": "2026-10-13", "endTime": "10:00:00", "durationMinutes": 120}
+        keep_shift_span(echoed, {"endDate": "2026-10-14", "endTime": "10:00:00", "durationMinutes": 1560})
+        self.assertEqual(echoed["durationMinutes"], 1560)
+        self.assertEqual(echoed["endDate"], "2026-10-14")
         self.assertEqual(person_state([{"status": "active", "startTime": "09:00:00"}]), STATE_AT_WORK)
         self.assertEqual(person_state([{"status": "completed", "startTime": "09:00:00"}]), STATE_AWAY)
 
@@ -139,3 +159,141 @@ class ShiftQueueTests(unittest.TestCase):
                 self.assertEqual(db.count_pending_session_ops(), 0)
             finally:
                 db.close()
+
+    def test_overnight_shift_keeps_its_length_when_the_end_date_is_dropped(self) -> None:
+        wall = '{"message":"Protected by Vercel Authentication","protection":{"vercel_auth_enabled":true}}'
+        posted = []
+
+        def transport(request, timeout, context):
+            del timeout, context
+            url = request.full_url
+            if "example.test" in url:
+                return 401, wall.encode("utf-8")
+            if request.method == "GET" and "/rest/v1/users" in url:
+                return 200, b'[{"id": 3, "fullName": "\xd0\x9f\xd0\xb5\xd1\x82\xd1\x80\xd0\xbe\xd0\xb2", "badgeId": "55001"}]'
+            if request.method == "GET" and "/rest/v1/workSessions" in url:
+                body = (
+                    '[{"id": 4, "userId": 3, "date": "2026-10-13", "startTime": "08:00:00", '
+                    '"endTime": "10:00:00", "durationMinutes": 120, "status": "completed"}]'
+                )
+                return 200, body.encode("utf-8")
+            if request.method == "PATCH" and "id=eq.4" in url:
+                body = json.loads(request.data.decode("utf-8"))
+                posted.append(body)
+                echo = {
+                    "id": 4,
+                    "userId": 3,
+                    "date": "2026-10-13",
+                    "startTime": body.get("startTime") or "08:00:00",
+                    "endTime": body.get("endTime"),
+                    "durationMinutes": 120,
+                    "status": body.get("status") or "manually_edited",
+                }
+                return 200, json.dumps([echo]).encode("utf-8")
+            return 500, b""
+
+        settings = default_settings()
+        settings["server"]["base_url"] = "https://example.test"
+        settings["server"]["read_url"] = "https://example.test"
+        settings["server"]["write_url"] = "https://example.test"
+        settings["server"]["supabase_url"] = "https://db.test"
+        settings["server"]["supabase_key"] = "anon-key"
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "t.db")
+            try:
+                book = ShiftBook(db, ApiClient(settings, transport=transport))
+                view = book.load()
+                closed = next(row for row in sessions_for_user(view["sessions"], 3) if row["id"] == 4)
+                kind, text = book.change_closed(closed, "13.10.2026", "08:00", "14.10.2026", "10:00")
+                self.assertEqual(kind, "sent")
+                self.assertEqual(text, "Отправлено на сервер.")
+                self.assertEqual(posted[0]["durationMinutes"], 1560)
+                self.assertEqual(posted[0]["startTime"], "08:00:00")
+                self.assertEqual(posted[0]["endTime"], "10:00:00")
+                self.assertEqual(posted[0]["date"], "2026-10-13")
+                self.assertNotIn("endDate", posted[0])
+                _users, stored = db.load_directory()
+                remembered = next(row for row in stored if row["id"] == 4)
+                self.assertEqual(remembered["durationMinutes"], 1560)
+                self.assertEqual(remembered["endDate"], "2026-10-14")
+                server_row = {
+                    "id": 4,
+                    "userId": 3,
+                    "date": "2026-10-13",
+                    "startTime": "08:00:00",
+                    "endTime": "10:00:00",
+                    "durationMinutes": 1560,
+                    "status": "completed",
+                }
+                end_day = format_date_ru(session_end_day(server_row))
+                self.assertEqual(end_day, "14.10.2026")
+                kind, _text = book.change_closed(server_row, "13.10.2026", "08:00", end_day, "10:00")
+                self.assertEqual(kind, "sent")
+                self.assertEqual(posted[-1]["durationMinutes"], 1560)
+                self.assertNotIn("endDate", posted[-1])
+            finally:
+                db.close()
+
+    def test_pending_shift_is_posted_once_and_survives_a_restart(self) -> None:
+        posts = []
+
+        def transport(request, timeout, context):
+            del timeout, context
+            if request.method == "POST" and "/workSessions" in request.full_url:
+                posts.append(request.full_url)
+                time.sleep(0.2)
+                body = '{"id": 9, "userId": 2, "date": "2026-10-14", "startTime": "09:00:00", "endTime": null, "status": "active"}'
+                return 200, body.encode("utf-8")
+            return 500, b""
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "t.db"
+            db = Database(path)
+            try:
+                book = ShiftBook(db, self._client(transport))
+                op_id = db.insert_session_op(
+                    "create",
+                    "2",
+                    "",
+                    "local-1",
+                    {
+                        "userId": 2,
+                        "date": "2026-10-14",
+                        "startTime": "09:00:00",
+                        "endTime": None,
+                        "status": "active",
+                        "source": "manual",
+                    },
+                )
+                errors = []
+
+                def run() -> None:
+                    try:
+                        book._flush_one(op_id)
+                    except Exception as exc:
+                        errors.append(exc)
+
+                workers = [threading.Thread(target=run), threading.Thread(target=run)]
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(3)
+                self.assertEqual(errors, [])
+                self.assertEqual(len(posts), 1)
+                self.assertEqual(db.get_session_op(op_id)["status"], "sent")
+                stuck = db.insert_session_op(
+                    "create",
+                    "2",
+                    "",
+                    "local-2",
+                    {"userId": 2, "date": "2026-10-14", "startTime": "10:00:00", "status": "active"},
+                )
+                self.assertTrue(db.claim_session_op(stuck))
+                self.assertEqual(db.get_session_op(stuck)["status"], "sending")
+            finally:
+                db.close()
+            reopened = Database(path)
+            try:
+                self.assertEqual(reopened.get_session_op(stuck)["status"], "pending")
+            finally:
+                reopened.close()
