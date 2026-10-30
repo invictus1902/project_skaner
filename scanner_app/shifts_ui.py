@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from datetime import datetime
 from tkinter import messagebox, ttk
 
@@ -111,10 +112,15 @@ class ShiftsWindow(tk.Toplevel):
         self.people.heading("name", text="Сотрудник")
         self.people.heading("badge", text="Бейдж")
         self.people.heading("state", text="Сейчас")
-        self.people.column("name", width=220, anchor="w")
-        self.people.column("badge", width=110, anchor="w")
-        self.people.column("state", width=170, anchor="w")
+        self.people.column("name", width=260, minwidth=140, stretch=True, anchor="w")
+        self.people.column("badge", width=76, minwidth=64, stretch=False, anchor="w")
+        self.people.column("state", width=176, minwidth=160, stretch=False, anchor="w")
         self.people.pack(fill="both", expand=True)
+        self.people.bind("<Motion>", self._people_motion, add="+")
+        self.people.bind("<Leave>", self._hide_people_tip, add="+")
+        self._people_tip = None
+        self._people_tip_label = None
+        self._people_tip_text = ""
         self.people.tag_configure("at_work", foreground=self._theme["in_text"])
         self.people.tag_configure("away", foreground=self._theme["text"])
         self.people.tag_configure("never", foreground=self._theme["muted"])
@@ -136,18 +142,29 @@ class ShiftsWindow(tk.Toplevel):
         )
         self.session_hint.pack(side="bottom", fill="x", anchor="w", pady=(8, 0))
         self.sessions = ttk.Treeview(right, columns=("date", "start", "end", "length", "state"), show="headings", height=6)
-        for column, title, width in (
-            ("date", "Дата", 110),
-            ("start", "Приход", 80),
-            ("end", "Уход", 130),
-            ("length", "Длительность", 110),
-            ("state", "Состояние", 180),
+        date_w, start_w, end_w, length_w = self._session_fixed_widths()
+        for column, title, width, stretch in (
+            ("date", "Дата", date_w, False),
+            ("start", "Приход", start_w, False),
+            ("end", "Уход", end_w, False),
+            ("length", "Длительность", length_w, False),
+            ("state", "Состояние", 120, True),
         ):
             self.sessions.heading(column, text=title)
-            self.sessions.column(column, width=width, anchor="w")
+            self.sessions.column(
+                column,
+                width=width,
+                minwidth=width if not stretch else 48,
+                stretch=stretch,
+                anchor="w",
+            )
         self.sessions.pack(side="top", fill="both", expand=True, pady=(0, 0))
         self._paint_shift_actions()
-        self.sessions.tag_configure("open", foreground=self._theme["in_text"])
+        self.sessions.tag_configure(
+            "open",
+            background=self._theme["open_bg"],
+            foreground=self._theme["in_text"],
+        )
         self.sessions.tag_configure("closed", foreground=self._theme["text"])
         self.sessions.tag_configure("pending", foreground=self._theme["warn_text"])
         self.sessions.bind("<Double-1>", lambda _event: self._edit())
@@ -267,7 +284,8 @@ class ShiftsWindow(tk.Toplevel):
             tag = "open" if is_open(session) else "closed"
             if session.get("pending"):
                 state += ", ждёт отправки"
-                tag = "pending"
+                if not is_open(session):
+                    tag = "pending"
             tree_rows.append(
                 (
                     iid,
@@ -446,6 +464,14 @@ class ShiftsWindow(tk.Toplevel):
             )
 
     def _close(self) -> None:
+        self._hide_people_tip()
+        tip = getattr(self, "_people_tip", None)
+        if tip is not None:
+            try:
+                tip.destroy()
+            except tk.TclError:
+                pass
+            self._people_tip = None
         app = self.app
         if getattr(app, "_shifts", None) is self:
             app._shifts = None
@@ -464,14 +490,101 @@ class ShiftsWindow(tk.Toplevel):
     def _fit_people(self, event) -> None:
         if event.widget is not self.people or event.width < 200:
             return
-        self.people.column("name", width=max(160, event.width - 300))
+        badge_w = 76
+        state_w = 176
+        name_w = max(140, event.width - badge_w - state_w - 24)
+        self.people.column("badge", width=badge_w, minwidth=64, stretch=False)
+        self.people.column("state", width=state_w, minwidth=160, stretch=False)
+        self.people.column("name", width=name_w, minwidth=140, stretch=True)
+
+    def _session_fixed_widths(self) -> tuple[int, int, int, int]:
+        """Ширина даты, прихода, ухода и длительности. Лишнее остаётся у состояния."""
+        cached = getattr(self, "_session_fixed", None)
+        if cached:
+            return cached
+        style = ttk.Style(self)
+        cell = tkfont.Font(self, font=style.lookup("Treeview", "font"))
+        head = tkfont.Font(self, font=style.lookup("Treeview.Heading", "font"))
+
+        def width(sample: str, title: str) -> int:
+            # У ячейки внутренний отступ 4px с каждой стороны, у заголовка padding 3px.
+            return max(cell.measure(sample) + 16, head.measure(title) + 14)
+
+        self._session_fixed = (
+            width("30.10.2026", "Дата"),
+            width("08:40", "Приход"),
+            width("14.10 10:00", "Уход"),
+            width("12 ч 30 мин", "Длительность"),
+        )
+        return self._session_fixed
 
     def _fit_sessions(self, event) -> None:
         if event.widget is not self.sessions or event.width < 200:
             return
-        self.sessions.column("state", width=max(140, event.width - 400))
+        date_w, start_w, end_w, length_w = self._session_fixed_widths()
+        state_w = max(48, event.width - date_w - start_w - end_w - length_w - 4)
+        fitted = (date_w, start_w, end_w, length_w, state_w)
+        if fitted != getattr(self, "_session_fit", None):
+            self._session_fit = fitted
+            self.sessions.column("date", width=date_w, minwidth=date_w, stretch=False)
+            self.sessions.column("start", width=start_w, minwidth=start_w, stretch=False)
+            self.sessions.column("end", width=end_w, minwidth=end_w, stretch=False)
+            self.sessions.column("length", width=length_w, minwidth=length_w, stretch=False)
+            self.sessions.column("state", width=state_w, minwidth=48, stretch=True)
         if getattr(self, "session_hint", None) is not None:
             self.session_hint.configure(wraplength=max(240, event.width - 8))
+
+    def _people_motion(self, event) -> None:
+        row = self.people.identify_row(event.y)
+        column = self.people.identify_column(event.x)
+        if column != "#1" or not row:
+            self._hide_people_tip()
+            return
+        name = str(self.people.set(row, "name") or "")
+        if not name or name == "—":
+            self._hide_people_tip()
+            return
+        try:
+            font = tkfont.Font(font=(self.sans, 12))
+            if font.measure(name) + 28 <= int(self.people.column("name", "width")):
+                self._hide_people_tip()
+                return
+        except (tk.TclError, ValueError):
+            pass
+        self._show_people_tip(name, event)
+
+    def _show_people_tip(self, text: str, event) -> None:
+        theme = self._theme
+        if self._people_tip is None:
+            tip = tk.Toplevel(self)
+            tip.wm_overrideredirect(True)
+            try:
+                tip.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            label = tk.Label(tip, justify="left", anchor="w", padx=8, pady=4, font=(self.sans, 12))
+            label.pack()
+            self._people_tip = tip
+            self._people_tip_label = label
+        if text != self._people_tip_text:
+            self._people_tip_text = text
+            self._people_tip_label.configure(text=text, bg=theme["card"], fg=theme["text"])
+        x = self.people.winfo_rootx() + event.x + 14
+        y = self.people.winfo_rooty() + event.y + 18
+        self._people_tip.geometry(f"+{x}+{y}")
+        try:
+            self._people_tip.deiconify()
+        except tk.TclError:
+            self._people_tip = None
+
+    def _hide_people_tip(self, _event=None) -> None:
+        tip = getattr(self, "_people_tip", None)
+        if tip is None:
+            return
+        try:
+            tip.withdraw()
+        except tk.TclError:
+            self._people_tip = None
 
     def _show_error(self, message: str) -> None:
         try:

@@ -697,7 +697,8 @@ class AttendanceService:
         spoken="",
         phrase=None,
     ) -> None:
-        self.ui.show(self._view(state, title, name, when, detail, badge))
+        length = self._shift_length(badge) if event == "out" else ""
+        self.ui.show(self._view(state, title, name, when, detail, badge, length))
         self.ui.refresh_history()
         self.ui.set_pending(self.db.count_pending())
         voice = settings.get("voice") or {}
@@ -714,7 +715,7 @@ class AttendanceService:
             phrase = render_speech((voice.get("templates") or {}).get(template, ""), values)
         self.speaker.say(phrase, voice)
 
-    def _view(self, state, title, name, when, detail, badge) -> dict:
+    def _view(self, state, title, name, when, detail, badge, length: str = "") -> dict:
         return {
             "state": state,
             "title": title,
@@ -722,7 +723,48 @@ class AttendanceService:
             "when": when,
             "detail": detail,
             "badge": badge,
+            "length": length,
         }
+
+    def _shift_length(self, badge: str) -> str:
+        """Подпись длительности ухода. Минуты в базе не меняет."""
+        if not badge:
+            return ""
+        pair = self.db.departure_pair(badge)
+        if not pair:
+            return ""
+        start = self._stored_clock(pair[0])
+        end = self._stored_clock(pair[1])
+        if start is None or end is None:
+            return ""
+        if start.tzinfo is None and end.tzinfo is not None:
+            start = start.replace(tzinfo=end.tzinfo)
+        elif end.tzinfo is None and start.tzinfo is not None:
+            end = end.replace(tzinfo=start.tzinfo)
+        try:
+            minutes = int(round((end - start).total_seconds() / 60))
+        except TypeError:
+            return ""
+        if minutes < 0:
+            return ""
+        if minutes == 0:
+            minutes = 1
+        from scanner_app.shifts import format_duration
+
+        text = format_duration(minutes)
+        return f"Смена {text}" if text else ""
+
+    def _stored_clock(self, row: dict) -> datetime | None:
+        """Часы скана из исходной отметки, а не время, которым сервер потом переписал строку."""
+        try:
+            data = json.loads(row.get("payload") or "{}")
+        except json.JSONDecodeError:
+            data = {}
+        if isinstance(data, dict):
+            stamped = parse_iso(str(data.get("timestamp") or ""))
+            if stamped is not None:
+                return stamped
+        return parse_iso(str(row.get("scanned_at") or ""))
 
     def _flush_once(self) -> None:
         self._flush_pending()

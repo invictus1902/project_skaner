@@ -5,6 +5,7 @@ THEMES = {
         "bg": "#070a10",
         "header": "#070a10",
         "card": "#0d131c",
+        "open_bg": "#123528",
         "row": "#101822",
         "text": "#e7f2ff",
         "muted": "#8ea0b8",
@@ -42,6 +43,7 @@ THEMES = {
         "bg": "#e7eef6",
         "header": "#e7eef6",
         "card": "#f7fbff",
+        "open_bg": "#d7f3e4",
         "row": "#ffffff",
         "text": "#0c1422",
         "muted": "#5c6d82",
@@ -79,6 +81,7 @@ THEMES = {
         "bg": "#000000",
         "header": "#000000",
         "card": "#000000",
+        "open_bg": "#143000",
         "row": "#1a1a1a",
         "text": "#ffe14a",
         "muted": "#fff2a8",
@@ -135,6 +138,32 @@ def apply_ttk_style(style, theme: dict, sans: str) -> None:
         pass
     style.configure(".", background=bg, foreground=fg, font=(sans, 11))
     style.configure("TFrame", background=bg)
+    style.configure("Card.TFrame", background=theme["card"], relief="flat", borderwidth=0)
+    style.configure(
+        "CardShell.TFrame",
+        background=theme["card"],
+        relief="solid",
+        borderwidth=1,
+        bordercolor=theme["line"],
+        lightcolor=theme["line"],
+        darkcolor=theme["line"],
+    )
+    style.configure("Card.TLabel", background=theme["card"], foreground=fg, font=(sans, 11))
+    style.configure("CardTitle.TLabel", background=theme["card"], foreground=fg, font=(sans, 13))
+    style.configure("CardMuted.TLabel", background=theme["card"], foreground=theme["muted"], font=(sans, 11))
+    style.configure(
+        "Card.TCheckbutton",
+        background=theme["card"],
+        foreground=fg,
+        font=(sans, 11),
+        indicatorcolor=theme["entry"],
+    )
+    style.map(
+        "Card.TCheckbutton",
+        indicatorcolor=[("selected", theme["accent"]), ("!selected", theme["entry"])],
+        background=[("active", theme["card"])],
+        foreground=[("disabled", theme["muted"])],
+    )
     style.configure("TLabel", background=bg, foreground=fg, font=(sans, 11))
     style.configure("Muted.TLabel", background=bg, foreground=theme["muted"], font=(sans, 11))
     style.configure("TCheckbutton", background=bg, foreground=fg, font=(sans, 11), indicatorcolor=theme["entry"])

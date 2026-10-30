@@ -313,6 +313,36 @@ class Database:
             ).fetchone()
         return dict(row) if row else None
 
+    def departure_pair(self, badge: str) -> tuple[dict, dict] | None:
+        """Последний учтённый уход и приход или повтор перед ним. Только для подписи на экране."""
+        with self._lock:
+            end = self._conn.execute(
+                """
+                SELECT id, scanned_at, payload FROM events
+                WHERE badge = ? AND event_type = 'out'
+                  AND status IN ('pending', 'sending', 'sent')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (badge,),
+            ).fetchone()
+            if not end:
+                return None
+            start = self._conn.execute(
+                """
+                SELECT id, scanned_at, payload FROM events
+                WHERE badge = ? AND event_type IN ('in', 'repeat')
+                  AND status IN ('pending', 'sending', 'sent')
+                  AND id < ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (badge, int(end["id"])),
+            ).fetchone()
+        if not start:
+            return None
+        return dict(start), dict(end)
+
     def recent_events(self, limit: int = 8) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(

@@ -361,13 +361,38 @@ class ScrollFrame(ttk.Frame):
 
 
 class Form(ttk.Frame):
-    def __init__(self, master) -> None:
-        super().__init__(master)
+    def __init__(self, master, *, on_card: bool = False) -> None:
+        super().__init__(master, style="Card.TFrame" if on_card else "TFrame")
+        self.on_card = on_card
         self.columnconfigure(1, weight=1)
         self.row = 0
 
+    def _text_style(self) -> str:
+        return "Card.TLabel" if self.on_card else "TLabel"
+
+    def _muted_style(self) -> str:
+        return "CardMuted.TLabel" if self.on_card else "Muted.TLabel"
+
+    def _check_style(self) -> str:
+        return "Card.TCheckbutton" if self.on_card else "TCheckbutton"
+
+    def _frame_style(self) -> str:
+        return "Card.TFrame" if self.on_card else "TFrame"
+
+    def card(self, title: str) -> "Form":
+        shell = ttk.Frame(self, style="CardShell.TFrame", padding=(16, 12, 16, 8))
+        shell.grid(row=self.row, column=0, columnspan=2, sticky="ew", padx=8, pady=(12, 4))
+        shell.columnconfigure(0, weight=1)
+        self.row += 1
+        ttk.Label(shell, text=title, style="CardTitle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 2))
+        inner = Form(shell, on_card=True)
+        inner.grid(row=1, column=0, sticky="ew")
+        return inner
+
     def combo(self, label: str, variable, values=(), width: int = 62):
-        ttk.Label(self, text=label).grid(row=self.row, column=0, columnspan=2, sticky="w", padx=16, pady=(8, 2))
+        ttk.Label(self, text=label, style=self._text_style()).grid(
+            row=self.row, column=0, columnspan=2, sticky="w", padx=16, pady=(8, 2)
+        )
         self.row += 1
         widget = ttk.Combobox(self, textvariable=variable, values=values, width=width)
         widget.grid(row=self.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 2))
@@ -375,7 +400,9 @@ class Form(ttk.Frame):
         return widget
 
     def entry(self, label: str, variable, show=None, width: int = 62):
-        ttk.Label(self, text=label).grid(row=self.row, column=0, columnspan=2, sticky="w", padx=16, pady=(8, 2))
+        ttk.Label(self, text=label, style=self._text_style()).grid(
+            row=self.row, column=0, columnspan=2, sticky="w", padx=16, pady=(8, 2)
+        )
         self.row += 1
         widget = ttk.Entry(self, textvariable=variable, show=show, width=width)
         widget.grid(row=self.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 2))
@@ -383,19 +410,20 @@ class Form(ttk.Frame):
         return widget
 
     def check(self, text: str, variable):
-        widget = ttk.Checkbutton(self, text=text, variable=variable)
+        widget = ttk.Checkbutton(self, text=text, variable=variable, style=self._check_style())
         widget.grid(row=self.row, column=0, columnspan=2, sticky="w", padx=16, pady=2)
         self.row += 1
         return widget
 
-    def label(self, text: str, wrap: int = 880):
-        widget = ttk.Label(self, text=text, wraplength=wrap, justify="left")
+    def label(self, text: str, wrap: int = 880, muted: bool = False):
+        style = self._muted_style() if muted else self._text_style()
+        widget = ttk.Label(self, text=text, wraplength=wrap, justify="left", style=style)
         widget.grid(row=self.row, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
         self.row += 1
         return widget
 
     def buttons(self, *pairs):
-        frame = ttk.Frame(self)
+        frame = ttk.Frame(self, style=self._frame_style())
         frame.grid(row=self.row, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 12))
         for item in pairs:
             text, command = item[0], item[1]

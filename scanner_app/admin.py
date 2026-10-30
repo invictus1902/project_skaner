@@ -210,6 +210,9 @@ class AdminWindow(tk.Toplevel):
         self.serif, _serif_bold, self.sans = faces(self)
         self._style_widgets()
         self._init_vars()
+        self._voices_ready = False
+        self._voice_touched = False
+        self._filling_voices = False
         self._build()
         self._load_voices()
         self._refresh_ports()
@@ -221,6 +224,8 @@ class AdminWindow(tk.Toplevel):
         self.bind_all("<MouseWheel>", self._wheel)
         self._refresh_staff()
         self.protocol("WM_DELETE_WINDOW", self._close)
+        self._bind_dirty()
+        self._sync_save()
         ensure_independent(self)
         present_window(self)
 
@@ -232,6 +237,9 @@ class AdminWindow(tk.Toplevel):
         self._theme = theme
         self.configure(bg=theme["bg"])
         apply_ttk_style(ttk.Style(self), theme, self.sans)
+        if getattr(self, "log_text", None) is not None:
+            _paint_text(self.log_text, theme)
+            self._paint_log_tags()
 
     def _init_vars(self) -> None:
         server = self.settings["server"]
@@ -328,7 +336,9 @@ class AdminWindow(tk.Toplevel):
         ttk.Label(bar, textvariable=self.status_text).pack(side="left")
         ttk.Button(bar, text="Смены", command=self._open_shifts).pack(side="left", padx=(12, 0))
         ttk.Button(bar, text="Закрыть", command=self._close).pack(side="right")
-        ttk.Button(bar, text="Сохранить", command=self._save, style="Accent.TButton").pack(side="right", padx=8)
+        self.save_button = ttk.Button(bar, text="Сохранить", command=self._save, style="Accent.TButton")
+        self.save_button.pack(side="right", padx=8)
+        self.save_button.state(["disabled"])
         tk.Frame(self, height=1, bg=self._theme["line"]).pack(side="bottom", fill="x", padx=12)
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=12, pady=(8, 4))
@@ -352,104 +362,118 @@ class AdminWindow(tk.Toplevel):
         return scroll, form
 
     def _server_tab(self) -> ScrollFrame:
-        scroll, form = self._scroll_form(
-            "Адреса меняются здесь, если сервер перенесут на другой хост. Код программы открывать не нужно."
+        scroll, form = self._scroll_form("")
+        addresses = form.card("Адреса")
+        addresses.label(
+            "Адреса меняются здесь, если сервер перенесут на другой хост. Код программы открывать не нужно.",
+            muted=True,
         )
-        form.entry("Получение данных: сотрудники и кто на работе", self.read_url)
-        form.entry("Отправка данных: отметки прихода и ухода", self.write_url)
-        form.buttons(("Рабочий сервер", self._use_hosted), ("Локальный сервер", self._use_local))
-        form.check("Протокол сайта учёта: сотрудники, смены и отметка бейджем", self.site_mode)
-        ttk.Label(form, textvariable=self.staff_text, wraplength=860, justify="left").grid(
-            row=form.row, column=0, columnspan=2, sticky="w", padx=10, pady=(4, 8)
+        addresses.entry("Получение данных: сотрудники и кто на работе", self.read_url)
+        addresses.entry("Отправка данных: отметки прихода и ухода", self.write_url)
+        addresses.buttons(("Рабочий сервер", self._use_hosted), ("Локальный сервер", self._use_local))
+        addresses.check("Протокол сайта учёта: сотрудники, смены и отметка бейджем", self.site_mode)
+        ttk.Label(addresses, textvariable=self.staff_text, style="Card.TLabel", wraplength=820, justify="left").grid(
+            row=addresses.row, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 8)
         )
-        form.row += 1
-        form.buttons(("Проверить сервер и число сотрудников", self._test_server))
-        form.label(
+        addresses.row += 1
+        addresses.buttons(("Проверить сервер и число сотрудников", self._test_server))
+        login = form.card("Вход")
+        login.label(
             "Вход в профиль сайта. Нужен, чтобы отметки прихода и ухода принимал сервер. "
-            "Сотрудники в «Сменах» видны и без входа. Пароль в программу не зашит."
+            "Сотрудники в «Сменах» видны и без входа. Пароль в программу не зашит.",
+            muted=True,
         )
-        self._auth_combo = form.combo("Профиль администратора", self.auth_login)
-        self._auth_password_entry = form.entry("Пароль этого профиля", self.auth_password, show="*")
-        form.check("Показывать пароль", self.show_auth_password)
+        self._auth_combo = login.combo("Профиль администратора", self.auth_login)
+        self._auth_password_entry = login.entry("Пароль этого профиля", self.auth_password, show="*")
+        login.check("Показывать пароль", self.show_auth_password)
         self.show_auth_password.trace_add("write", self._toggle_auth_password)
-        ttk.Label(form, textvariable=self.auth_text, wraplength=860, justify="left").grid(
-            row=form.row, column=0, columnspan=2, sticky="w", padx=10, pady=(4, 8)
+        ttk.Label(login, textvariable=self.auth_text, style="Card.TLabel", wraplength=820, justify="left").grid(
+            row=login.row, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 8)
         )
-        form.row += 1
-        form.buttons(
+        login.row += 1
+        login.buttons(
             ("Войти", self._sign_in, "Accent.TButton"),
             ("Выйти из профиля", self._sign_out),
             ("Обновить список профилей", self._load_profiles),
         )
-        form.label("Дальше — таймаут, ключ доступа и настройки другого сервера.")
-        form.entry("Таймаут, секунды", self.timeout)
-        form.entry("Идентификатор этого компьютера", self.device_id)
-        form.check("Проверять сертификат HTTPS", self.verify_ssl)
-        form.check("Не пропускать бейдж, если сервер его не знает", self.strict)
-        self._token_entry = form.entry("Ключ доступа, если сервер его требует", self.token, show="*")
-        form.check("Показывать ключ", self.show_token)
+        link = form.card("Связь")
+        link.entry("Таймаут, секунды", self.timeout)
+        link.entry("Идентификатор этого компьютера", self.device_id)
+        link.check("Проверять сертификат HTTPS", self.verify_ssl)
+        link.check("Не пропускать бейдж, если сервер его не знает", self.strict)
+        self._token_entry = link.entry("Ключ доступа, если сервер его требует", self.token, show="*")
+        link.check("Показывать ключ", self.show_token)
         self.show_token.trace_add("write", self._toggle_token)
-        form.entry("Адрес другого сервера, если протокол сайта выключен", self.base_url)
-        form.entry("Путь проверки связи", self.path_health)
-        form.entry("Путь сотрудника, с {badge}", self.path_employee)
-        form.entry("Путь статуса смены, с {badge}", self.path_status)
-        form.entry("Путь отправки события", self.path_event)
-        form.entry("Длина смены, часы", self.shift_hours)
-        form.entry("Повторная отправка очереди, секунды", self.retry_sec)
-        form.label(API_HELP)
+        other = form.card("Другой сервер")
+        other.entry("Адрес другого сервера, если протокол сайта выключен", self.base_url)
+        other.entry("Путь проверки связи", self.path_health)
+        other.entry("Путь сотрудника, с {badge}", self.path_employee)
+        other.entry("Путь статуса смены, с {badge}", self.path_status)
+        other.entry("Путь отправки события", self.path_event)
+        other.entry("Длина смены, часы", self.shift_hours)
+        other.entry("Повторная отправка очереди, секунды", self.retry_sec)
+        other.label(API_HELP, muted=True)
         return scroll
 
     def _scanner_tab(self) -> ScrollFrame:
-        scroll, form = self._scroll_form(
+        scroll, form = self._scroll_form("")
+        keyboard = form.card("Клавиатура")
+        keyboard.label(
             "Почти все USB-сканеры штрихкодов и QR работают как клавиатура: драйвер не нужен. "
             "Подключите сканер и отсканируйте бейдж на вкладке «Обслуживание» — код появится в протоколе. "
-            "Если код рвётся на части, увеличьте интервал между символами."
+            "Если код рвётся на части, увеличьте интервал между символами.",
+            muted=True,
         )
-        form.check("Принимать сканер как клавиатуру", self.keyboard)
-        form.check("Завершать код клавишей Enter", self.term_enter)
-        form.check("Завершать код клавишей Tab", self.term_tab)
-        form.entry("Минимальная длина кода", self.min_len)
-        form.entry("Максимальная длина кода", self.max_len)
-        form.entry("Максимальный интервал между символами, мс", self.interval)
-        form.entry("Пауза, после которой код считается законченным, мс", self.idle)
-        form.entry("Игнорировать повтор того же бейджа, секунды", self.cooldown)
-        form.check("Убирать служебный префикс сканера (]C1, ]Q3…)", self.aim)
-        form.entry("Свой префикс, который нужно отрезать", self.prefix)
-        form.entry("Свой суффикс, который нужно отрезать", self.suffix)
-        form.entry("Регулярное выражение для кода бейджа", self.regex)
-        form.label("Если QR содержит лишний текст, укажите выражение с группой. Пример: badge=([A-Za-z0-9]+)")
-        form.check("Переводить код в верхний регистр", self.upper)
-        form.label("COM-порт нужен только сканеру, который не умеет работать как клавиатура.")
-        form.check("Читать сканер через COM-порт", self.serial)
-        form.entry("COM-порт", self.port)
-        form.entry("Скорость порта", self.baud)
-        form.buttons(("Обновить список портов", self._refresh_ports), ("Проверить порт", self._probe_port))
-        ttk.Label(form, textvariable=self.ports_text, wraplength=860).grid(
-            row=form.row, column=0, columnspan=2, sticky="w", padx=10, pady=4
+        keyboard.check("Принимать сканер как клавиатуру", self.keyboard)
+        keyboard.check("Завершать код клавишей Enter", self.term_enter)
+        keyboard.check("Завершать код клавишей Tab", self.term_tab)
+        keyboard.entry("Минимальная длина кода", self.min_len)
+        keyboard.entry("Максимальная длина кода", self.max_len)
+        keyboard.entry("Максимальный интервал между символами, мс", self.interval)
+        keyboard.entry("Пауза, после которой код считается законченным, мс", self.idle)
+        keyboard.entry("Игнорировать повтор того же бейджа, секунды", self.cooldown)
+        parsed = form.card("Разбор кода")
+        parsed.check("Убирать служебный префикс сканера (]C1, ]Q3…)", self.aim)
+        parsed.entry("Свой префикс, который нужно отрезать", self.prefix)
+        parsed.entry("Свой суффикс, который нужно отрезать", self.suffix)
+        parsed.entry("Регулярное выражение для кода бейджа", self.regex)
+        parsed.label("Если QR содержит лишний текст, укажите выражение с группой. Пример: badge=([A-Za-z0-9]+)", muted=True)
+        parsed.check("Переводить код в верхний регистр", self.upper)
+        port = form.card("COM-порт")
+        port.label("COM-порт нужен только сканеру, который не умеет работать как клавиатура.", muted=True)
+        port.check("Читать сканер через COM-порт", self.serial)
+        port.entry("COM-порт", self.port)
+        port.entry("Скорость порта", self.baud)
+        port.buttons(("Обновить список портов", self._refresh_ports), ("Проверить порт", self._probe_port))
+        ttk.Label(port, textvariable=self.ports_text, style="Card.TLabel", wraplength=820).grid(
+            row=port.row, column=0, columnspan=2, sticky="w", padx=16, pady=4
         )
+        port.row += 1
         return scroll
 
     def _voice_tab(self) -> ScrollFrame:
-        scroll, form = self._scroll_form(
-            "Голос нужен тем, кто не видит экран. Для нормальной русской речи выберите голос Irina или другой русский голос Windows. "
-            "Фразы можно менять. Доступны вставки: {name}, {time}, {badge}, {event_phrase}."
+        scroll, form = self._scroll_form("")
+        speech = form.card("Речь")
+        speech.label(
+            "Голос нужен тем, кто не видит экран. Для нормальной русской речи выберите голос Irina или другой русский голос Windows.",
+            muted=True,
         )
-        form.check("Произносить результат", self.voice_enabled)
-        form.check("Если голос не выбран, говорить по-русски", self.prefer_russian)
-        form.check("Короткий сигнал динамика", self.beep)
-        form.entry("Скорость голоса, от −10 до 10", self.rate)
-        form.entry("Громкость, от 0 до 100", self.volume)
-        ttk.Label(form, text="Голос").grid(row=form.row, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
-        form.row += 1
-        self.voice_box = ttk.Combobox(form, textvariable=self.voice_choice, state="readonly", width=58)
-        self.voice_box.grid(row=form.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 4))
-        form.row += 1
-        form.buttons(("Произнести пример", self._test_voice), ("Обновить список голосов", self._load_voices))
+        speech.check("Произносить результат", self.voice_enabled)
+        speech.check("Если голос не выбран, говорить по-русски", self.prefer_russian)
+        speech.check("Короткий сигнал динамика", self.beep)
+        speech.entry("Скорость голоса, от −10 до 10", self.rate)
+        speech.entry("Громкость, от 0 до 100", self.volume)
+        speech.label("Голос")
+        self.voice_box = ttk.Combobox(speech, textvariable=self.voice_choice, state="readonly", width=58)
+        self.voice_box.grid(row=speech.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 4))
+        speech.row += 1
+        speech.buttons(("Произнести пример", self._test_voice), ("Обновить список голосов", self._load_voices))
+        phrases = form.card("Фразы")
+        phrases.label("Фразы можно менять. Доступны вставки: {name}, {time}, {badge}, {event_phrase}.", muted=True)
         self.template_boxes = {}
         for key, label in TEMPLATE_LABELS:
-            ttk.Label(form, text=label).grid(row=form.row, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
-            form.row += 1
-            box = tk.Text(form, height=2, width=60, wrap="word", relief="flat", bd=0)
+            phrases.label(label)
+            box = tk.Text(phrases, height=2, width=60, wrap="word", relief="flat", bd=0)
             box.configure(
                 bg=self._theme["entry"],
                 fg=self._theme["text"],
@@ -460,44 +484,47 @@ class AdminWindow(tk.Toplevel):
                 highlightcolor=self._theme["accent"],
             )
             box.insert("1.0", (self.settings["voice"].get("templates") or {}).get(key, ""))
-            box.grid(row=form.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 4))
+            box.grid(row=phrases.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 4))
             self.template_boxes[key] = box
-            form.row += 1
+            phrases.row += 1
         return scroll
 
     def _look_tab(self) -> ScrollFrame:
         scroll, form = self._scroll_form("")
-        form.entry("Заголовок", self.title_text)
-        ttk.Label(form, text="Тема").grid(row=form.row, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
-        form.row += 1
+        screen = form.card("Экран")
+        screen.entry("Заголовок", self.title_text)
+        screen.label("Тема")
         theme_box = ttk.Combobox(
-            form,
+            screen,
             textvariable=self.theme_choice,
             state="readonly",
             values=[label for _key, label in THEME_LABELS],
             width=40,
         )
-        theme_box.grid(row=form.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 4))
-        form.row += 1
-        form.entry("Размер шрифта, от 0.7 до 2.2", self.font_scale)
-        form.entry("Сколько секунд показывать результат", self.hold_sec)
-        form.check("Полный экран", self.fullscreen)
-        form.check("Показывать номер бейджа на экране", self.show_badge)
-        form.check("Предупреждать о русской раскладке", self.warn_layout)
-        form.check("Спрашивать пароль при закрытии программы", self.lock_exit)
+        theme_box.grid(row=screen.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 4))
+        screen.row += 1
+        screen.entry("Размер шрифта, от 0.7 до 2.2", self.font_scale)
+        screen.entry("Сколько секунд показывать результат", self.hold_sec)
+        screen.check("Полный экран", self.fullscreen)
+        screen.check("Показывать номер бейджа на экране", self.show_badge)
+        screen.check("Предупреждать о русской раскладке", self.warn_layout)
+        screen.check("Спрашивать пароль при закрытии программы", self.lock_exit)
+        password = form.card("Пароль закрытия")
         note = "Пустые поля оставляют старый пароль. Новый пароль — не короче 4 символов."
         if password_is_default(self.settings):
             note = "Сейчас стоит пароль по умолчанию: admin. Смените его. " + note
-        form.label(note)
-        pair = ttk.Frame(form)
-        pair.grid(row=form.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(4, 8))
+        password.label(note, muted=True)
+        pair = ttk.Frame(password, style="Card.TFrame")
+        pair.grid(row=password.row, column=0, columnspan=2, sticky="ew", padx=16, pady=(4, 8))
         pair.columnconfigure(0, weight=1)
         pair.columnconfigure(1, weight=1)
-        ttk.Label(pair, text="Новый пароль").grid(row=0, column=0, sticky="w")
-        ttk.Label(pair, text="Повтор нового пароля").grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Label(pair, text="Новый пароль", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(pair, text="Повтор нового пароля", style="Card.TLabel").grid(row=0, column=1, sticky="w", padx=(12, 0))
         ttk.Entry(pair, textvariable=self.new_password, show="*").grid(row=1, column=0, sticky="ew", pady=(2, 0))
-        ttk.Entry(pair, textvariable=self.confirm_password, show="*").grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(2, 0))
-        form.row += 1
+        ttk.Entry(pair, textvariable=self.confirm_password, show="*").grid(
+            row=1, column=1, sticky="ew", padx=(12, 0), pady=(2, 0)
+        )
+        password.row += 1
         return scroll
 
     def _log_tab(self) -> ttk.Frame:
@@ -515,37 +542,50 @@ class AdminWindow(tk.Toplevel):
         return frame
 
     def _tools_tab(self) -> ScrollFrame:
-        scroll, form = self._scroll_form("Проверка без настоящего сервера и управление этим компьютером.")
-        form.entry("Код бейджа: цифры, буквы или символы", self.sim_code)
-        form.buttons(("Отметить этим кодом", self._simulate, "Accent.TButton"))
-        self.result_label = ttk.Label(form, text="Последний результат появится здесь.", wraplength=860, justify="left")
-        self.result_label.grid(row=form.row, column=0, columnspan=2, sticky="w", padx=10, pady=4)
-        form.row += 1
-        ttk.Label(form, text="Протокол сканера").grid(row=form.row, column=0, columnspan=2, sticky="w", padx=10)
-        form.row += 1
-        self.debug_text = scrolledtext.ScrolledText(form, height=6, wrap="word", font=(self.sans, 10), relief="flat")
+        scroll, form = self._scroll_form("")
+        trial = form.card("Проверка отметки")
+        trial.label("Проверка без настоящего сервера.", muted=True)
+        trial.entry("Код бейджа: цифры, буквы или символы", self.sim_code)
+        trial.buttons(("Отметить этим кодом", self._simulate, "Accent.TButton"))
+        self.result_label = ttk.Label(
+            trial,
+            text="Последний результат появится здесь.",
+            style="Card.TLabel",
+            wraplength=820,
+            justify="left",
+        )
+        self.result_label.grid(row=trial.row, column=0, columnspan=2, sticky="w", padx=16, pady=4)
+        trial.row += 1
+        protocol = form.card("Протокол сканера")
+        self.debug_text = scrolledtext.ScrolledText(protocol, height=6, wrap="word", font=(self.sans, 10), relief="flat")
         _paint_text(self.debug_text, self._theme)
-        self.debug_text.grid(row=form.row, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
+        self.debug_text.grid(row=protocol.row, column=0, columnspan=2, sticky="ew", padx=16, pady=4)
         self.debug_text.configure(state="disabled")
-        form.row += 1
-        form.label("Локальный справочник используется, когда сервер не прислал имя. Это не замена серверу.")
-        form.entry("Бейдж", self.emp_badge)
-        form.entry("Имя", self.emp_name)
-        form.buttons(("Добавить в справочник", self._add_employee), ("Удалить выбранного", self._delete_employee))
-        self.employee_tree = self._tree(form, ("badge", "name"), ("Бейдж", "Имя"), height=5)
-        form.label("Очередь неотправленных отметок")
-        form.buttons(("Обновить очередь", self._refresh_queue), ("Отправить сейчас", self._flush))
+        protocol.row += 1
+        directory = form.card("Локальный справочник")
+        directory.label("Используется, когда сервер не прислал имя. Это не замена серверу.", muted=True)
+        directory.entry("Бейдж", self.emp_badge)
+        directory.entry("Имя", self.emp_name)
+        directory.buttons(("Добавить в справочник", self._add_employee), ("Удалить выбранного", self._delete_employee))
+        self.employee_tree = self._tree(directory, ("badge", "name"), ("Бейдж", "Имя"), height=5)
+        queue = form.card("Очередь")
+        queue.label("Неотправленные отметки.", muted=True)
+        queue.buttons(("Обновить очередь", self._refresh_queue), ("Отправить сейчас", self._flush))
         self.queue_tree = self._tree(
-            form,
+            queue,
             ("when", "badge", "name", "event", "error"),
             ("Время", "Бейдж", "Имя", "Событие", "Ошибка"),
             height=5,
         )
-        self.autostart_label = ttk.Label(form, text=self._autostart_text())
-        self.autostart_label.grid(row=form.row, column=0, columnspan=2, sticky="w", padx=10, pady=(12, 4))
-        form.row += 1
-        form.buttons(("Добавить в автозагрузку Windows", self._enable_autostart), ("Убрать из автозагрузки", self._disable_autostart))
-        form.label(f"Папка данных: {LOG_DIR.parent}")
+        computer = form.card("Этот компьютер")
+        self.autostart_label = ttk.Label(computer, text=self._autostart_text(), style="Card.TLabel")
+        self.autostart_label.grid(row=computer.row, column=0, columnspan=2, sticky="w", padx=16, pady=(8, 4))
+        computer.row += 1
+        computer.buttons(
+            ("Добавить в автозагрузку Windows", self._enable_autostart),
+            ("Убрать из автозагрузки", self._disable_autostart),
+        )
+        computer.label(f"Папка данных: {LOG_DIR.parent}", muted=True)
         return scroll
 
     def _tree(self, form: Form, columns: tuple[str, ...], headings: tuple[str, ...], height: int):
@@ -644,6 +684,94 @@ class AdminWindow(tk.Toplevel):
                 errors.append("Новый пароль должен быть не короче 4 символов")
         return data, errors
 
+    def _bind_dirty(self) -> None:
+        variables = (
+            self.read_url,
+            self.write_url,
+            self.base_url,
+            self.site_mode,
+            self.token,
+            self.timeout,
+            self.device_id,
+            self.verify_ssl,
+            self.strict,
+            self.path_health,
+            self.path_employee,
+            self.path_status,
+            self.path_event,
+            self.shift_hours,
+            self.retry_sec,
+            self.keyboard,
+            self.serial,
+            self.port,
+            self.baud,
+            self.min_len,
+            self.max_len,
+            self.interval,
+            self.idle,
+            self.term_enter,
+            self.term_tab,
+            self.aim,
+            self.prefix,
+            self.suffix,
+            self.regex,
+            self.upper,
+            self.cooldown,
+            self.voice_enabled,
+            self.prefer_russian,
+            self.beep,
+            self.rate,
+            self.volume,
+            self.title_text,
+            self.theme_choice,
+            self.font_scale,
+            self.fullscreen,
+            self.show_badge,
+            self.warn_layout,
+            self.lock_exit,
+            self.hold_sec,
+            self.new_password,
+            self.confirm_password,
+        )
+        for variable in variables:
+            variable.trace_add("write", self._sync_save)
+        self.voice_choice.trace_add("write", self._voice_edited)
+        for box in self.template_boxes.values():
+            box.bind("<KeyRelease>", self._sync_save)
+
+    def _voice_edited(self, *_args) -> None:
+        if not self._filling_voices:
+            self._voice_touched = True
+        self._sync_save()
+
+    def _is_dirty(self) -> bool:
+        import copy
+
+        if self.new_password.get() or self.confirm_password.get():
+            return True
+        data, errors = self.collect()
+        if errors:
+            return True
+        normalize_settings(data)
+        saved = copy.deepcopy(self.settings)
+        normalize_settings(saved)
+        if not self._voice_touched:
+            data["voice"]["voice_id"] = saved["voice"]["voice_id"]
+        return data != saved
+
+    def _sync_save(self, *_args) -> None:
+        button = getattr(self, "save_button", None)
+        if button is None:
+            return
+        try:
+            dirty = self._is_dirty()
+        except Exception:
+            dirty = True
+        if dirty:
+            button.state(["!disabled"])
+        else:
+            button.state(["disabled"])
+
     def _save(self) -> None:
         data, errors = self.collect()
         if errors:
@@ -662,6 +790,7 @@ class AdminWindow(tk.Toplevel):
         self.app.apply_settings(data)
         self.status_text.set("Сохранено")
         self._style_widgets()
+        self._sync_save()
 
     def _auth_status_text(self) -> str:
         server = self.settings.get("server") or {}
@@ -782,6 +911,7 @@ class AdminWindow(tk.Toplevel):
                 self.auth_password.set("")
                 self.auth_text.set(self._auth_status_text())
                 self.status_text.set("Вход выполнен")
+                self._sync_save()
 
             try:
                 self.after(0, apply)
@@ -807,6 +937,7 @@ class AdminWindow(tk.Toplevel):
         self.auth_login.set("")
         self.auth_text.set("Вход сброшен. Отметки снова ждут, пока не войдёте профилем администратора.")
         self.status_text.set("Выход выполнен")
+        self._sync_save()
 
     def _test_server(self) -> None:
         data, errors = self.collect()
@@ -891,7 +1022,13 @@ class AdminWindow(tk.Toplevel):
                 selected = label
         self._voice_ids = mapping
         self.voice_box.configure(values=labels)
-        self.voice_choice.set(selected if selected in mapping else "По умолчанию")
+        self._filling_voices = True
+        try:
+            self.voice_choice.set(selected if selected in mapping else "По умолчанию")
+        finally:
+            self._filling_voices = False
+        self._voices_ready = True
+        self._sync_save()
         if self.app.speaker.error:
             self.status_text.set("Голос недоступен")
 
@@ -998,6 +1135,21 @@ class AdminWindow(tk.Toplevel):
         self.status_text.set("Отправка очереди запущена")
         self.after(1200, self._refresh_queue)
 
+    def _paint_log_tags(self) -> None:
+        theme = self._theme
+        self.log_text.tag_configure("INFO", foreground=theme["muted"])
+        self.log_text.tag_configure("WARNING", foreground=theme["warn_text"])
+        self.log_text.tag_configure("ERROR", foreground=theme["error_text"])
+
+    def _log_level_tag(self, line: str) -> str:
+        parts = line.split("  ", 2)
+        level = parts[1] if len(parts) > 1 else ""
+        if level in ("ERROR", "CRITICAL"):
+            return "ERROR"
+        if level == "WARNING":
+            return "WARNING"
+        return "INFO"
+
     def _refresh_log(self) -> None:
         if not widget_alive(getattr(self, "log_text", None)):
             return
@@ -1009,7 +1161,14 @@ class AdminWindow(tk.Toplevel):
         try:
             self.log_text.configure(state="normal")
             self.log_text.delete("1.0", "end")
-            self.log_text.insert("1.0", "\n".join(lines) if lines else "Журнал пуст")
+            self._paint_log_tags()
+            if not lines:
+                self.log_text.insert("1.0", "Журнал пуст")
+            else:
+                for index, line in enumerate(lines):
+                    if index:
+                        self.log_text.insert("end", "\n")
+                    self.log_text.insert("end", line, self._log_level_tag(line))
             self.log_text.configure(state="disabled")
             self.log_text.see("end")
         except tk.TclError:
